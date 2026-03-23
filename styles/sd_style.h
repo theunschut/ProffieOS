@@ -17,6 +17,50 @@
 #include "../common/color.h"
 #include "../blades/blade_base.h"
 #include "../common/arg_parser.h"
+#include "../common/sin_table.h"
+// Minimal vector replacement — no C++ exceptions, works on bare metal.
+template<typename T>
+class RtVec {
+public:
+  RtVec() : data_(nullptr), size_(0), cap_(0) {}
+  RtVec(RtVec&& o) noexcept : data_(o.data_), size_(o.size_), cap_(o.cap_) {
+    o.data_ = nullptr; o.size_ = o.cap_ = 0;
+  }
+  RtVec& operator=(RtVec&& o) noexcept {
+    if (this != &o) {
+      if (data_) free(data_);
+      data_ = o.data_; size_ = o.size_; cap_ = o.cap_;
+      o.data_ = nullptr; o.size_ = o.cap_ = 0;
+    }
+    return *this;
+  }
+  ~RtVec() { if (data_) free(data_); }
+  void push_back(const T& v) { grow_if_needed(); data_[size_++] = v; }
+  void resize(int n, T val = T()) {
+    if (n > cap_) { data_ = (T*)realloc(data_, n * sizeof(T)); cap_ = n; }
+    for (int i = size_; i < n; i++) data_[i] = val;
+    size_ = n;
+  }
+  T& operator[](int i) { return data_[i]; }
+  const T& operator[](int i) const { return data_[i]; }
+  int size() const { return size_; }
+  bool empty() const { return size_ == 0; }
+  T& back() { return data_[size_-1]; }
+  const T& back() const { return data_[size_-1]; }
+  T* begin() { return data_; }
+  T* end() { return data_ + size_; }
+  const T* begin() const { return data_; }
+  const T* end() const { return data_ + size_; }
+private:
+  void grow_if_needed() {
+    if (size_ < cap_) return;
+    int new_cap = cap_ ? cap_ * 2 : 4;
+    data_ = (T*)realloc(data_, new_cap * sizeof(T));
+    cap_ = new_cap;
+  }
+  T* data_; int size_, cap_;
+};
+template<typename T> static inline T&& rt_move(T& x) { return static_cast<T&&>(x); }
 
 // ---------------------------------------------------------------------------
 // Base node classes
@@ -367,6 +411,541 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Additional function nodes
+// ---------------------------------------------------------------------------
+
+// Variation: SaberBase::GetCurrentVariation() & 0x7fff
+class RtVariation : public RtFuncNode {
+public:
+  void run(BladeBase*) override { v_ = SaberBase::GetCurrentVariation() & 0x7fff; }
+  int getInteger(int) override { return v_; }
+private: int v_ = 0;
+};
+
+// AltF: current color-change alternative index
+class RtAltF : public RtFuncNode {
+public:
+  void run(BladeBase*) override {}
+  int getInteger(int) override { return current_alternative; }
+};
+
+// NoisySoundLevel: dynamic_mixer.last_sum() * 3
+class RtNoisySoundLevel : public RtFuncNode {
+public:
+  void run(BladeBase*) override {
+    v_ = rt_clamp((int)(dynamic_mixer.last_sum() * 3), 0, 32768);
+  }
+  int getInteger(int) override { return v_; }
+private: int v_ = 0;
+};
+
+// BatteryLevel: 0-32768
+class RtBatteryLevel : public RtFuncNode {
+public:
+  void run(BladeBase*) override {
+    v_ = rt_clamp(battery_monitor.battery_percent() * 32768 / 100, 0, 32768);
+  }
+  int getInteger(int) override { return v_; }
+private: int v_ = 0;
+};
+
+// RampF: led * 32768 / num_leds (linear gradient)
+class RtRampF : public RtFuncNode {
+public:
+  void run(BladeBase* b) override { n_ = b->num_leds(); }
+  int getInteger(int led) override { return n_ ? led * 32768 / n_ : 0; }
+private: int n_ = 1;
+};
+
+// SwingSpeed<MAX>
+class RtSwingSpeed : public RtFuncNode {
+public:
+  explicit RtSwingSpeed(RtFuncNode* mx) : mx_(mx) {}
+  ~RtSwingSpeed() override { delete mx_; }
+  void run(BladeBase* b) override {
+    mx_->run(b);
+    int mx = mx_->getInteger(0);
+    if (mx <= 0) mx = 1;
+#if defined(FUSE_H) || defined(COMMON_FUSE_H)
+    v_ = rt_clamp((int)(fusor.swing_speed() * 32768.0f / mx), 0, 32768);
+#else
+    v_ = 0;
+#endif
+  }
+  int getInteger(int) override { return v_; }
+private: RtFuncNode* mx_; int v_ = 0;
+};
+
+// TwistAngle<N=2>
+class RtTwistAngle : public RtFuncNode {
+public:
+  explicit RtTwistAngle(int n = 2) : n_(n) {}
+  void run(BladeBase*) override {
+#if defined(FUSE_H) || defined(COMMON_FUSE_H)
+    int a = (int)(fusor.angle2() * 32768.0f / M_PI);
+    int v = ((a * n_) & 0xffff);
+    v_ = (v >= 0x8000) ? (0x10000 - v) : v;
+#else
+    v_ = 16384;
+#endif
+  }
+  int getInteger(int) override { return v_; }
+private: int n_; int v_ = 16384;
+};
+
+// Sin<RPM, LOW, HIGH>
+class RtSin : public RtFuncNode {
+public:
+  RtSin(RtFuncNode* rpm, RtFuncNode* lo, RtFuncNode* hi)
+    : rpm_(rpm), lo_(lo), hi_(hi) {}
+  ~RtSin() override { delete rpm_; delete lo_; delete hi_; }
+  void run(BladeBase* b) override {
+    rpm_->run(b); lo_->run(b); hi_->run(b);
+    uint32_t now = micros();
+    pos_ = fract(pos_ + (now - last_) / 60000000.0f * rpm_->getInteger(0));
+    last_ = now;
+    int lo = lo_->getInteger(0), hi = hi_->getInteger(0);
+    float s = sin_table[(int)(pos_ * 1024) & 1023] / 32768.0f;
+    v_ = (int)((s + 0.5f) * (hi - lo) + lo);
+  }
+  int getInteger(int) override { return v_; }
+private:
+  RtFuncNode* rpm_; RtFuncNode* lo_; RtFuncNode* hi_;
+  float pos_ = 0; uint32_t last_ = 0; int v_ = 0;
+  static float fract(float x) { return x - (int)x; }
+};
+
+// SlowNoise<SPEED>: random walk
+class RtSlowNoise : public RtFuncNode {
+public:
+  explicit RtSlowNoise(RtFuncNode* speed) : speed_(speed) {}
+  ~RtSlowNoise() override { delete speed_; }
+  void run(BladeBase* b) override {
+    speed_->run(b);
+    uint32_t now = micros();
+    uint32_t delta_us = now - last_; last_ = now;
+    uint32_t ticks = delta_us / 1000;
+    if (ticks > 100) ticks = 100;
+    int sp = speed_->getInteger(0) / 32 + 1;
+    for (uint32_t i = 0; i < ticks; i++) {
+      v_ += (int)(random(sp * 2 + 1)) - sp;
+      if (v_ < 0) v_ = 0;
+      if (v_ > 32768) v_ = 32768;
+    }
+  }
+  int getInteger(int) override { return v_; }
+private:
+  RtFuncNode* speed_; int v_ = 16384; uint32_t last_ = 0;
+};
+
+// ClashImpactF<MIN,MAX>
+class RtClashImpactF : public RtFuncNode {
+public:
+  RtClashImpactF(int mn, int mx) : mn_(mn), mx_(mx) {}
+  void run(BladeBase*) override {
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    float strength = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (effects[i].type == EFFECT_CLASH || effects[i].type == EFFECT_CLASH_UPDATE)
+        strength = std::max(strength, effects[i].location.fixed() / 32768.0f * (mx_ - mn_) + mn_);
+    }
+    v_ = rt_clamp((int)(strength * 32768.0f / mx_), 0, 32768);
+  }
+  int getInteger(int) override { return v_; }
+private: int mn_, mx_, v_ = 0;
+};
+
+// WavLen<EFFECT>: sound length in ms
+class RtWavLen : public RtFuncNode {
+public:
+  explicit RtWavLen(EffectType effect) : effect_(effect) {}
+  void run(BladeBase*) override {
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if (effects[i].type == effect_) {
+        v_ = (int)(effects[i].sound_length * 1000.0f);
+        return;
+      }
+    }
+    // fall back to last known or a default
+  }
+  int getInteger(int) override { return v_ > 0 ? v_ : 400; }
+private: EffectType effect_; int v_ = 0;
+};
+
+// EffectRandomF<EFFECT>: random value, refreshed on each new effect
+class RtEffectRandomF : public RtFuncNode {
+public:
+  explicit RtEffectRandomF(EffectType effect) : effect_(effect) {}
+  void run(BladeBase*) override {
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if (effects[i].type == effect_ && effects[i].start_micros != last_) {
+        last_ = effects[i].start_micros; v_ = random(32768);
+      }
+    }
+  }
+  int getInteger(int) override { return v_; }
+private: EffectType effect_; uint32_t last_ = 0; int v_ = 0;
+};
+
+// EffectPosition<EFFECT>: location on blade (0=hilt, 32768=tip)
+class RtEffectPosition : public RtFuncNode {
+public:
+  explicit RtEffectPosition(EffectType effect) : effect_(effect) {}
+  void run(BladeBase*) override {
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if (effects[i].type == effect_) { v_ = effects[i].location.fixed(); return; }
+    }
+  }
+  int getInteger(int) override { return v_; }
+private: EffectType effect_; int v_ = 16384;
+};
+
+// BlastF<FADE_MS, WAVE_SIZE, WAVE_MS, EFFECT>
+static const uint8_t rt_blast_hump[32] = {
+  255,255,252,247,240,232,222,211,199,186,173,159,145,132,119,106,
+  94,82,72,62,53,45,38,32,26,22,18,14,11,9,7,5
+};
+class RtBlastF : public RtFuncNode {
+public:
+  RtBlastF(int fade_ms, int wave_size, int wave_ms, EffectType effect)
+    : fade_ms_(fade_ms), wave_size_(wave_size), wave_ms_(wave_ms), effect_(effect) {}
+  void run(BladeBase* b) override {
+    n_ = b->num_leds();
+    num_blasts_ = SaberBase::GetEffects(&effects_);
+  }
+  int getInteger(int led) override {
+    int mix = 0;
+    for (size_t i = 0; i < num_blasts_; i++) {
+      if (effects_[i].type != effect_) continue;
+      uint32_t T = micros() - effects_[i].start_micros;
+      int M = 1000 - (int)(T / (uint32_t)fade_ms_);
+      if (M > 0) {
+        float dist = fabsf(effects_[i].location.fixed() / 32768.0f - led / (float)n_);
+        int N = (int)(fabsf(dist - T / (wave_ms_ * 1000.0f)) * wave_size_);
+        if (N < 32) mix += rt_blast_hump[N] * M / 1000;
+      }
+    }
+    return rt_clamp(mix << 7, 0, 32768);
+  }
+private:
+  int fade_ms_, wave_size_, wave_ms_, n_ = 1;
+  EffectType effect_;
+  size_t num_blasts_ = 0;
+  BladeEffect* effects_ = nullptr;
+};
+
+// LocalizedClashF<FADE_MS, WIDTH_PCT, EFFECT>: static bump at clash point, fades over time
+// Used by LocalizedClashL to show a localized bump (no expanding wave).
+class RtLocalizedClashF : public RtFuncNode {
+public:
+  RtLocalizedClashF(int fade_ms, int width_pct, EffectType effect)
+    : fade_ms_(fade_ms), width_pct_(width_pct), effect_(effect) {}
+  void run(BladeBase* b) override {
+    n_ = b->num_leds();
+    num_effects_ = SaberBase::GetEffects(&effects_);
+  }
+  int getInteger(int led) override {
+    int mix = 0;
+    for (size_t i = 0; i < num_effects_; i++) {
+      if (effects_[i].type != effect_) continue;
+      uint32_t T = micros() - effects_[i].start_micros;
+      int M = 1000 - (int)(T * 1000u / (uint32_t)fade_ms_);
+      if (M > 0) {
+        // Bump centered at clash location, half-width = width_pct/200 of blade
+        // wave_size = 6400/width_pct so that N < 32 covers width_pct% of blade
+        float loc_frac = effects_[i].location.fixed() / 32768.0f;
+        float led_frac = (float)led / (float)n_;
+        float dist = fabsf(loc_frac - led_frac);
+        int wave_size = (width_pct_ > 0) ? (6400 / width_pct_) : 128;
+        int N = (int)(dist * wave_size);
+        if (N < 32) mix += rt_blast_hump[N] * M / 1000;
+      }
+    }
+    return rt_clamp(mix << 7, 0, 32768);
+  }
+private:
+  int fade_ms_, width_pct_, n_ = 1;
+  EffectType effect_;
+  size_t num_effects_ = 0;
+  BladeEffect* effects_ = nullptr;
+};
+
+// BrownNoiseF<GRADE>: per-LED correlated random walk
+class RtBrownNoiseF : public RtFuncNode {
+public:
+  explicit RtBrownNoiseF(int grade) : grade_(grade) {}
+  void run(BladeBase* b) override {
+    n_ = b->num_leds();
+    if (n_ != (int)vals_.size()) vals_.resize(n_, 16384);
+    uint32_t now = micros();
+    int ticks = (now - last_) / 1000; last_ = now;
+    if (ticks > 50) ticks = 50;
+    for (int t = 0; t < ticks; t++) {
+      int step = grade_ / 128 + 1;
+      for (int i = 0; i < n_; i++) {
+        vals_[i] += (int)(random(step * 2 + 1)) - step;
+        if (i > 0) vals_[i] = (vals_[i] * 3 + vals_[i-1]) >> 2;
+        vals_[i] = rt_clamp(vals_[i], 0, 32768);
+      }
+    }
+  }
+  int getInteger(int led) override {
+    if (led < 0 || led >= (int)vals_.size()) return 16384;
+    return vals_[led];
+  }
+private:
+  int grade_, n_ = 0;
+  uint32_t last_ = 0;
+  RtVec<int> vals_;
+};
+
+// HumpFlickerF<N>: gaussian hump shapes
+class RtHumpFlickerF : public RtFuncNode {
+public:
+  explicit RtHumpFlickerF(int width) : width_(width) {}
+  void run(BladeBase* b) override {
+    n_ = b->num_leds();
+    if ((int)humps_.size() != n_ / 8 + 2) humps_.resize(n_ / 8 + 2);
+    for (auto& h : humps_) {
+      if (micros() - h.born > 200000ul) {
+        h.center = random(n_);
+        h.born = micros();
+      }
+    }
+  }
+  int getInteger(int led) override {
+    int sum = 0;
+    for (auto& h : humps_) {
+      int dist = abs(led - h.center) * 128;
+      int hw = width_ * n_ / 100 + 1;
+      int N = dist / hw;
+      if (N < 32) sum += rt_blast_hump[N];
+    }
+    return rt_clamp(sum, 0, 32768);
+  }
+private:
+  int width_, n_ = 0;
+  struct Hump { int center; uint32_t born; };
+  RtVec<Hump> humps_;
+};
+
+// RandomPerLEDF: per-LED independent random
+class RtRandomPerLEDF : public RtFuncNode {
+public:
+  void run(BladeBase* b) override {
+    int n = b->num_leds();
+    if ((int)vals_.size() != n) vals_.resize(n);
+    uint32_t now = micros();
+    if (now - last_ > 16000) {
+      last_ = now;
+      for (auto& v : vals_) v = random(32768);
+    }
+  }
+  int getInteger(int led) override {
+    return (led < (int)vals_.size()) ? vals_[led] : 0;
+  }
+private:
+  RtVec<int> vals_; uint32_t last_ = 0;
+};
+
+// StrobeF<FREQ, DUTY_MS>: binary on/off
+class RtStrobeF : public RtFuncNode {
+public:
+  RtStrobeF(int freq, int duty_ms) : period_us_(1000000 / (freq > 0 ? freq : 1)), duty_us_((uint32_t)duty_ms * 1000) {}
+  void run(BladeBase*) override {
+    uint32_t t = micros() % period_us_;
+    v_ = (t < duty_us_) ? 32768 : 0;
+  }
+  int getInteger(int) override { return v_; }
+private: uint32_t period_us_, duty_us_; int v_ = 0;
+};
+
+// PulsingF<MS>: sine pulse A→B→A
+class RtPulsingF : public RtFuncNode {
+public:
+  explicit RtPulsingF(RtFuncNode* ms) : ms_(ms) {}
+  ~RtPulsingF() override { delete ms_; }
+  void run(BladeBase* b) override {
+    ms_->run(b);
+    int ms = ms_->getInteger(0);
+    if (ms <= 0) ms = 1000;
+    uint32_t now = micros();
+    pos_ = fract(pos_ + (now - last_) / ((float)ms * 1000.0f));
+    last_ = now;
+    float s = sin_table[(int)(pos_ * 1024) & 1023] / 32768.0f;
+    v_ = (int)((s + 0.5f) * 32768.0f);
+  }
+  int getInteger(int) override { return v_; }
+private:
+  RtFuncNode* ms_; float pos_ = 0; uint32_t last_ = 0; int v_ = 0;
+  static float fract(float x) { return x - (int)x; }
+};
+
+// RandomF: random value per-frame (same across all LEDs)
+class RtRandomF : public RtFuncNode {
+public:
+  void run(BladeBase*) override { v_ = random(32769); }
+  int getInteger(int) override { return v_; }
+private: int v_ = 0;
+};
+
+// BlinkingF<PERIOD_MS, DUTY_PCT>: square wave on/off function
+class RtBlinkingF : public RtFuncNode {
+public:
+  RtBlinkingF(RtFuncNode* period_ms, int duty_pct)
+    : period_ms_(period_ms), duty_pct_(duty_pct) {}
+  ~RtBlinkingF() override { delete period_ms_; }
+  void run(BladeBase* b) override {
+    period_ms_->run(b);
+    int ms = period_ms_->getInteger(0);
+    if (ms <= 0) ms = 1000;
+    uint32_t t = millis() % (uint32_t)ms;
+    v_ = (t < (uint32_t)(ms * duty_pct_ / 100)) ? 32768 : 0;
+  }
+  int getInteger(int) override { return v_; }
+private: RtFuncNode* period_ms_; int duty_pct_; int v_ = 0;
+};
+
+// IsLessThan<A,B>: 0 or 32768
+class RtIsLessThan : public RtFuncNode {
+public:
+  RtIsLessThan(RtFuncNode* a, RtFuncNode* b) : a_(a), b_(b) {}
+  ~RtIsLessThan() override { delete a_; delete b_; }
+  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); v_ = a_->getInteger(0) < b_->getInteger(0) ? 32768 : 0; }
+  int getInteger(int) override { return v_; }
+private: RtFuncNode* a_; RtFuncNode* b_; int v_ = 0;
+};
+class RtIsGreaterThan : public RtFuncNode {
+public:
+  RtIsGreaterThan(RtFuncNode* a, RtFuncNode* b) : a_(a), b_(b) {}
+  ~RtIsGreaterThan() override { delete a_; delete b_; }
+  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); v_ = a_->getInteger(0) > b_->getInteger(0) ? 32768 : 0; }
+  int getInteger(int) override { return v_; }
+private: RtFuncNode* a_; RtFuncNode* b_; int v_ = 0;
+};
+
+// Sum<A,B>
+class RtSum : public RtFuncNode {
+public:
+  RtSum(RtFuncNode* a, RtFuncNode* b) : a_(a), b_(b) {}
+  ~RtSum() override { delete a_; delete b_; }
+  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); }
+  int getInteger(int led) override { return a_->getInteger(led) + b_->getInteger(led); }
+private: RtFuncNode* a_; RtFuncNode* b_;
+};
+
+// Mult<A,B>: (a*b) >> 15
+class RtMult : public RtFuncNode {
+public:
+  RtMult(RtFuncNode* a, RtFuncNode* b) : a_(a), b_(b) {}
+  ~RtMult() override { delete a_; delete b_; }
+  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); }
+  int getInteger(int led) override { return ((int64_t)a_->getInteger(led) * b_->getInteger(led)) >> 15; }
+private: RtFuncNode* a_; RtFuncNode* b_;
+};
+
+// ModF<F,N>: f % n
+class RtModF : public RtFuncNode {
+public:
+  RtModF(RtFuncNode* f, RtFuncNode* n) : f_(f), n_(n) {}
+  ~RtModF() override { delete f_; delete n_; }
+  void run(BladeBase* blade) override { f_->run(blade); n_->run(blade); }
+  int getInteger(int led) override { int n = n_->getInteger(0); return n ? f_->getInteger(led) % n : 0; }
+private: RtFuncNode* f_; RtFuncNode* n_;
+};
+
+// HoldPeakF<F, HOLD_MS, SPEED>
+class RtHoldPeakF : public RtFuncNode {
+public:
+  RtHoldPeakF(RtFuncNode* f, RtFuncNode* hold_ms, RtFuncNode* speed)
+    : f_(f), hold_ms_(hold_ms), speed_(speed) {}
+  ~RtHoldPeakF() override { delete f_; delete hold_ms_; delete speed_; }
+  void run(BladeBase* b) override {
+    f_->run(b); hold_ms_->run(b); speed_->run(b);
+    int cur = f_->getInteger(0);
+    uint32_t now = micros();
+    uint32_t delta = now - last_; last_ = now;
+    uint32_t hold = (uint32_t)hold_ms_->getInteger(0);
+    if ((uint32_t)(millis() - last_peak_) > hold) {
+      int decay = (int)((uint64_t)delta * speed_->getInteger(0) / 1000000);
+      v_ -= decay;
+    }
+    if (cur > v_) { v_ = cur; last_peak_ = millis(); }
+    if (v_ < 0) v_ = 0;
+  }
+  int getInteger(int) override { return v_; }
+private:
+  RtFuncNode* f_; RtFuncNode* hold_ms_; RtFuncNode* speed_;
+  int v_ = 0; uint32_t last_ = 0; uint32_t last_peak_ = 0;
+};
+
+// Trigger<EFFECT, SMOOTH_UP_MS, SMOOTH_DOWN_MS, ZERO_VALUE>
+class RtTrigger : public RtFuncNode {
+public:
+  RtTrigger(EffectType e, RtFuncNode* up, RtFuncNode* down, RtFuncNode* zero)
+    : effect_(e), up_(up), down_(down), zero_(zero) {}
+  ~RtTrigger() override { delete up_; delete down_; delete zero_; }
+  void run(BladeBase* b) override {
+    up_->run(b); down_->run(b); zero_->run(b);
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if (effects[i].type == effect_ && effects[i].start_micros != last_) {
+        last_ = effects[i].start_micros; fired_ms_ = millis();
+      }
+    }
+    uint32_t elapsed = millis() - fired_ms_;
+    int up_ms = up_->getInteger(0), dn_ms = down_->getInteger(0);
+    if (elapsed < (uint32_t)up_ms) {
+      v_ = elapsed * 32768 / (up_ms > 0 ? up_ms : 1);
+    } else if (elapsed < (uint32_t)(up_ms + dn_ms)) {
+      v_ = (up_ms + dn_ms - elapsed) * 32768 / (dn_ms > 0 ? dn_ms : 1);
+    } else {
+      v_ = zero_->getInteger(0);
+    }
+    v_ = rt_clamp(v_, 0, 32768);
+  }
+  int getInteger(int) override { return v_; }
+private:
+  EffectType effect_; RtFuncNode* up_; RtFuncNode* down_; RtFuncNode* zero_;
+  uint32_t last_ = 0; uint32_t fired_ms_ = 0; int v_ = 0;
+};
+
+// IgnitionTime<DEFAULT> / RetractionTime<DEFAULT>: sound length
+class RtIgnitionTime : public RtFuncNode {
+public:
+  explicit RtIgnitionTime(int def) : def_(def), v_(def) {}
+  void run(BladeBase*) override {
+    BladeEffect* fx; size_t n = SaberBase::GetEffects(&fx);
+    for (size_t i = 0; i < n; i++) {
+      if (fx[i].type == EFFECT_IGNITION && fx[i].sound_length > 0) {
+        v_ = (int)(fx[i].sound_length * 1000); return;
+      }
+    }
+    v_ = def_;
+  }
+  int getInteger(int) override { return v_; }
+private: int def_, v_;
+};
+class RtRetractionTime : public RtFuncNode {
+public:
+  explicit RtRetractionTime(int def) : def_(def), v_(def) {}
+  void run(BladeBase*) override {
+    BladeEffect* fx; size_t n = SaberBase::GetEffects(&fx);
+    for (size_t i = 0; i < n; i++) {
+      if (fx[i].type == EFFECT_RETRACTION && fx[i].sound_length > 0) {
+        v_ = (int)(fx[i].sound_length * 1000); return;
+      }
+    }
+    v_ = def_;
+  }
+  int getInteger(int) override { return v_; }
+private: int def_, v_;
+};
+
+// ---------------------------------------------------------------------------
 // RuntimeBladeStyle
 // ---------------------------------------------------------------------------
 
@@ -398,23 +977,36 @@ private:
   RtColorNode* root_;
 };
 
+// Forward declaration needed by SDStyleParser
+class RtTransNode;
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
 class SDStyleParser {
 public:
-  SDStyleParser(const char* s, int len) : s_(s), end_(s + len) {}
+  SDStyleParser(const char* s, int len) : s_(s), end_(s + len), start_(s) {}
 
   RtColorNode* parseColor();
   RtFuncNode*  parseFunc();
+  RtTransNode* parseTr();
+  EffectType   parseEffectType();
+  SaberBase::LockupType parseLockupType();
 
 private:
   // --- lexer helpers -------------------------------------------------
 
   void skipWS() {
-    while (s_ < end_ && (*s_ == ' ' || *s_ == '\t' || *s_ == '\n' || *s_ == '\r'))
-      ++s_;
+    while (s_ < end_) {
+      if (*s_ == ' ' || *s_ == '\t' || *s_ == '\n' || *s_ == '\r') { ++s_; continue; }
+      // Skip // line comments
+      if (*s_ == '/' && s_ + 1 < end_ && s_[1] == '/') {
+        while (s_ < end_ && *s_ != '\n') ++s_;
+        continue;
+      }
+      break;
+    }
   }
 
   bool peekChar(char c) { skipWS(); return s_ < end_ && *s_ == c; }
@@ -439,10 +1031,38 @@ private:
     skipWS();
     bool neg = (s_ < end_ && *s_ == '-');
     if (neg) ++s_;
-    int n = 0;
-    while (s_ < end_ && isdigit((uint8_t)*s_))
-      n = n * 10 + (*s_++ - '0');
-    return neg ? -n : n;
+    // Try digit parsing first
+    if (s_ < end_ && isdigit((uint8_t)*s_)) {
+      int n = 0;
+      while (s_ < end_ && isdigit((uint8_t)*s_))
+        n = n * 10 + (*s_++ - '0');
+      return neg ? -n : n;
+    }
+    if (neg) { --s_; return 0; }  // put '-' back
+    // Try named ArgumentName constants
+    const char* saved = s_;
+    char nm[48]; readIdent(nm, sizeof(nm));
+    struct { const char* n; int v; } kArgs[] = {
+      {"BASE_COLOR_ARG",1},{"ALT_COLOR_ARG",2},{"STYLE_OPTION_ARG",3},
+      {"IGNITION_OPTION_ARG",4},{"IGNITION_TIME_ARG",5},{"IGNITION_DELAY_ARG",6},
+      {"IGNITION_COLOR_ARG",7},{"IGNITION_POWER_UP_ARG",8},{"BLAST_COLOR_ARG",9},
+      {"CLASH_COLOR_ARG",10},{"LOCKUP_COLOR_ARG",11},{"LOCKUP_POSITION_ARG",12},
+      {"DRAG_COLOR_ARG",13},{"DRAG_SIZE_ARG",14},{"LB_COLOR_ARG",15},
+      {"STAB_COLOR_ARG",16},{"MELT_SIZE_ARG",17},{"SWING_COLOR_ARG",18},
+      {"SWING_OPTION_ARG",19},{"EMITTER_COLOR_ARG",20},{"EMITTER_SIZE_ARG",21},
+      {"PREON_COLOR_ARG",22},{"PREON_OPTION_ARG",23},{"PREON_SIZE_ARG",24},
+      {"RETRACTION_OPTION_ARG",25},{"RETRACTION_TIME_ARG",26},{"RETRACTION_DELAY_ARG",27},
+      {"RETRACTION_COLOR_ARG",28},{"RETRACTION_COOL_DOWN_ARG",29},{"POSTOFF_COLOR_ARG",30},
+      {"OFF_COLOR_ARG",31},{"OFF_OPTION_ARG",32},{"ALT_COLOR2_ARG",33},
+      {"ALT_COLOR3_ARG",34},{"STYLE_OPTION2_ARG",35},{"STYLE_OPTION3_ARG",36},
+      {"IGNITION_OPTION2_ARG",37},{"RETRACTION_OPTION2_ARG",38},
+      {nullptr,0}
+    };
+    for (int i = 0; kArgs[i].n; i++) {
+      if (!strcmp(nm, kArgs[i].n)) return kArgs[i].v;
+    }
+    s_ = saved;  // unknown ident — restore position
+    return 0;
   }
 
   // Parse a function-or-integer-literal arg (handles Int<N> and raw N).
@@ -484,6 +1104,754 @@ private:
   // --- state --------------------------------------------------------
   const char* s_;
   const char* end_;
+  const char* start_;
+  int unknown_count_ = 0;
+public:
+  int unknown_count() const { return unknown_count_; }
+private:
+};  // class SDStyleParser
+
+// ---------------------------------------------------------------------------
+// Additional color nodes
+// ---------------------------------------------------------------------------
+
+// RotateColorsX<ANGLE, COLOR>: rotate hue by angle (0-32768 = 360°)
+class RtRotateColorsX : public RtColorNode {
+public:
+  RtRotateColorsX(RtFuncNode* angle, RtColorNode* color) : angle_(angle), color_(color) {}
+  ~RtRotateColorsX() override { delete angle_; delete color_; }
+  void run(BladeBase* b) override { angle_->run(b); color_->run(b); }
+  RGBA_um getColor(int led) override {
+    RGBA_um c = color_->getColor(led);
+    int a = angle_->getInteger(led) & 0x7fff;
+    c.c = c.c.rotate(a * 3);
+    return c;
+  }
+private: RtFuncNode* angle_; RtColorNode* color_;
+};
+
+// Stripes: matches ProffieOS StripesBase exactly (integer math, same speed units)
+// WIDTH and SPEED use the same scale as ProffieOS: WIDTH~1000 for normal, SPEED units/ms
+class RtStripes : public RtColorNode {
+public:
+  RtStripes(RtFuncNode* width, RtFuncNode* speed, RtVec<RtColorNode*> colors)
+    : width_(width), speed_(speed), colors_(rt_move(colors)) {}
+  ~RtStripes() override {
+    delete width_; delete speed_;
+    for (auto* c : colors_) delete c;
+  }
+  void run(BladeBase* b) override {
+    width_->run(b); speed_->run(b);
+    for (auto* c : colors_) c->run(b);
+    nc_ = (int)colors_.size();
+    int width = width_->getInteger(0);
+    int speed = speed_->getInteger(0);
+    uint32_t now = micros();
+    int32_t delta_us = (int32_t)(now - last_);
+    last_ = now;
+    // Match ProffieOS: m = MOD(m + delta_micros * speed / 333, nc * 341 * 1024)
+    int range = nc_ * 341 * 1024;
+    if (range > 0) {
+      m_ = (int32_t)(((int64_t)m_ + (int64_t)delta_us * speed / 333) % range);
+      if (m_ < 0) m_ += range;
+    }
+    // mult_ = 50000 * 1024 / width  (ProffieOS StripesBase)
+    mult_ = (width > 0) ? (50000 * 1024 / width) : 20480;
+  }
+  RGBA_um getColor(int led) override {
+    if (colors_.empty() || nc_ == 0) return RGBA_um::Transparent();
+    // p = ((m + led * mult_) >> 10) % (nc * 341)  — matches ProffieOS exactly
+    int p = (int)(((int64_t)m_ + (int64_t)led * mult_) >> 10) % (nc_ * 341);
+    if (p < 0) p += nc_ * 341;
+    // Blend colors using sin_table (half-sine blend, same as ProffieOS StripesHelper::get)
+    Color16 ret(0, 0, 0);
+    auto blend_in = [&](int pp) {
+      for (int i = 0; i < nc_; i++, pp -= 341) {
+        if (pp > 0 && pp < 512) {
+          RGBA_um c = colors_[i]->getColor(led);
+          int mul = sin_table[pp];
+          ret.r = rt_clamp(ret.r + (int)((c.c.r * mul) >> 14), 0, 65535);
+          ret.g = rt_clamp(ret.g + (int)((c.c.g * mul) >> 14), 0, 65535);
+          ret.b = rt_clamp(ret.b + (int)((c.c.b * mul) >> 14), 0, 65535);
+        }
+      }
+    };
+    blend_in(p);
+    blend_in(p + nc_ * 341);  // wrap-around pass (ProffieOS does this too)
+    return RGBA_um{ ret, false, 32768 };
+  }
+private:
+  RtFuncNode* width_; RtFuncNode* speed_;
+  RtVec<RtColorNode*> colors_;
+  int32_t m_ = 0; uint32_t last_ = 0; int nc_ = 0; uint32_t mult_ = 20480;
+};
+
+// StyleFire: simplified fire simulation
+class RtStyleFire : public RtColorNode {
+public:
+  RtStyleFire(RtColorNode* c1, RtColorNode* c2, int speed, int base, int rand_val, int cooling)
+    : c1_(c1), c2_(c2), speed_(speed), base_(base), rand_(rand_val), cooling_(cooling) {}
+  ~RtStyleFire() override { delete c1_; delete c2_; }
+  void run(BladeBase* b) override {
+    c1_->run(b); c2_->run(b);
+    int n = b->num_leds();
+    if (n != (int)heat_.size()) { heat_.resize(n, 0); }
+    uint32_t now = millis();
+    if (now - last_ < 10) return;
+    last_ = now;
+    // Add heat at base
+    heat_[0] = rt_clamp(heat_[0] + base_ + (rand_ ? (int)random(rand_) : 0), 0, 255);
+    // Spread upward
+    for (int i = n - 1; i >= speed_; i--) {
+      int sum = 0;
+      for (int j = -speed_; j <= speed_; j++) {
+        int idx = rt_clamp(i + j, 0, n - 1);
+        sum += heat_[idx];
+      }
+      heat_[i] = sum / (speed_ * 2 + 1);
+    }
+    // Cool
+    for (int i = 0; i < n; i++) {
+      heat_[i] = rt_clamp(heat_[i] - (cooling_ > 0 ? (int)random(cooling_) : 0), 0, 255);
+    }
+  }
+  RGBA_um getColor(int led) override {
+    if ((int)heat_.size() <= led) return RGBA_um::Transparent();
+    int h = heat_[led];
+    // Map 0..255 to c1..c2..white
+    RGBA_um a = c1_->getColor(led), b = c2_->getColor(led);
+    if (h < 128) {
+      int mix = h * 256;  // 0..32768
+      return RGBA_um((a.c * (uint16_t)(32768 - mix) + b.c * (uint16_t)mix) >> 15, false, 32768);
+    } else {
+      int mix = (h - 128) * 256;
+      Color16 white(65535, 65535, 65535);
+      return RGBA_um((b.c * (uint16_t)(32768 - mix) + white * (uint16_t)mix) >> 15, false, 32768);
+    }
+  }
+private:
+  RtColorNode* c1_; RtColorNode* c2_;
+  int speed_, base_, rand_, cooling_;
+  RtVec<int> heat_; uint32_t last_ = 0;
+};
+
+// EffectSequence: cycle through colors on each effect trigger
+class RtEffectSequence : public RtColorNode {
+public:
+  RtEffectSequence(EffectType e, RtVec<RtColorNode*> colors)
+    : effect_(e), colors_(rt_move(colors)) {}
+  ~RtEffectSequence() override { for (auto* c : colors_) delete c; }
+  void run(BladeBase* b) override {
+    for (auto* c : colors_) c->run(b);
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if (effects[i].type == effect_ && effects[i].start_micros != last_) {
+        last_ = effects[i].start_micros;
+        idx_ = (idx_ + 1) % (int)colors_.size();
+      }
+    }
+  }
+  RGBA_um getColor(int led) override {
+    if (colors_.empty()) return RGBA_um::Transparent();
+    return colors_[idx_]->getColor(led);
+  }
+private:
+  EffectType effect_; RtVec<RtColorNode*> colors_;
+  int idx_ = 0; uint32_t last_ = 0;
+};
+
+// ColorSelect: pick color by AltF index
+class RtColorSelect : public RtColorNode {
+public:
+  explicit RtColorSelect(RtVec<RtColorNode*> colors)
+    : colors_(rt_move(colors)) {}
+  ~RtColorSelect() override { for (auto* c : colors_) delete c; }
+  void run(BladeBase* b) override { for (auto* c : colors_) c->run(b); }
+  RGBA_um getColor(int led) override {
+    if (colors_.empty()) return RGBA_um::Transparent();
+    int idx = current_alternative % (int)colors_.size();
+    return colors_[idx]->getColor(led);
+  }
+private: RtVec<RtColorNode*> colors_;
+};
+
+// Remap<FUNC, COLOR>: remap LED index
+class RtRemap : public RtColorNode {
+public:
+  RtRemap(RtFuncNode* f, RtColorNode* c) : f_(f), c_(c) {}
+  ~RtRemap() override { delete f_; delete c_; }
+  void run(BladeBase* b) override { f_->run(b); c_->run(b); n_ = b->num_leds(); }
+  RGBA_um getColor(int led) override {
+    int mapped = f_->getInteger(led) * n_ >> 15;
+    return c_->getColor(rt_clamp(mapped, 0, n_ - 1));
+  }
+private: RtFuncNode* f_; RtColorNode* c_; int n_ = 1;
+};
+
+// ---------------------------------------------------------------------------
+// Transition framework
+// ---------------------------------------------------------------------------
+
+static inline RGBA_um rt_mix_rgba(const RGBA_um& a, const RGBA_um& b, int mix, int shift) {
+  // mix: 0=all a, (1<<shift)=all b
+  int ma = (1 << shift) - mix;
+  return RGBA_um(
+    (a.c * (uint16_t)ma + b.c * (uint16_t)mix) >> shift,
+    mix >= (1 << (shift - 1)) ? b.overdrive : a.overdrive,
+    (uint16_t)(((uint32_t)a.alpha * ma + (uint32_t)b.alpha * (uint16_t)mix) >> shift)
+  );
+}
+
+class RtTransNode {
+public:
+  virtual ~RtTransNode() = default;
+  virtual void begin() = 0;
+  virtual bool done() const = 0;
+  virtual void run(BladeBase*) = 0;
+  virtual RGBA_um getColor(const RGBA_um& from, const RGBA_um& to, int led) = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Transitions
+// ---------------------------------------------------------------------------
+
+class RtTrInstant : public RtTransNode {
+public:
+  void begin() override { done_ = false; }
+  bool done() const override { return done_; }
+  void run(BladeBase*) override { done_ = true; }
+  RGBA_um getColor(const RGBA_um&, const RGBA_um& to, int) override { return to; }
+private: bool done_ = true;
+};
+
+// TrFadeX<MILLIS>
+class RtTrFadeX : public RtTransNode {
+public:
+  explicit RtTrFadeX(RtFuncNode* ms) : ms_(ms) {}
+  ~RtTrFadeX() override { delete ms_; }
+  void begin() override { start_ = millis(); len_ = -1; fade_ = 0; }
+  bool done() const override { return len_ >= 0 && (millis() - start_ >= (uint32_t)len_); }
+  void run(BladeBase* b) override {
+    if (len_ < 0) { ms_->run(b); len_ = ms_->getInteger(0); }
+    uint32_t el = millis() - start_;
+    fade_ = (len_ <= 0) ? 16384 : (int)std::min((uint64_t)el * 16384 / len_, (uint64_t)16384);
+  }
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um& b, int led) override {
+    return rt_mix_rgba(a, b, fade_, 14);
+  }
+private: RtFuncNode* ms_; uint32_t start_ = 0; int len_ = -1; int fade_ = 0;
+};
+
+// TrSmoothFadeX<MILLIS>
+class RtTrSmoothFadeX : public RtTransNode {
+public:
+  explicit RtTrSmoothFadeX(RtFuncNode* ms) : ms_(ms) {}
+  ~RtTrSmoothFadeX() override { delete ms_; }
+  void begin() override { start_ = millis(); len_ = -1; fade_ = 0; }
+  bool done() const override { return len_ >= 0 && (millis() - start_ >= (uint32_t)len_); }
+  void run(BladeBase* b) override {
+    if (len_ < 0) { ms_->run(b); len_ = ms_->getInteger(0); }
+    uint32_t el = millis() - start_;
+    int x = (len_ <= 0) ? 32768 : (int)std::min((uint64_t)el * 32768 / len_, (uint64_t)32768);
+    fade_ = (int)((((int64_t)x * x >> 14) * ((3 << 14) - x)) >> 16);
+  }
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um& b, int led) override {
+    return rt_mix_rgba(a, b, fade_, 14);
+  }
+private: RtFuncNode* ms_; uint32_t start_ = 0; int len_ = -1; int fade_ = 0;
+};
+
+// TrWipeX<MILLIS>: base-to-tip wipe
+class RtTrWipeX : public RtTransNode {
+public:
+  explicit RtTrWipeX(RtFuncNode* ms) : ms_(ms) {}
+  ~RtTrWipeX() override { delete ms_; }
+  void begin() override { start_ = millis(); len_ = -1; fade_ = 0; n_ = 0; }
+  bool done() const override { return len_ >= 0 && (millis() - start_ >= (uint32_t)len_); }
+  void run(BladeBase* b) override {
+    if (len_ < 0) { ms_->run(b); len_ = ms_->getInteger(0); }
+    n_ = b->num_leds();
+    uint32_t el = millis() - start_;
+    fade_ = (len_ <= 0) ? n_ * 256 : (int)std::min((uint64_t)el * n_ * 256 / len_, (uint64_t)(n_ * 256));
+  }
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um& b, int led) override {
+    int f = fade_ - led * 256;
+    int mix = rt_clamp(f, 0, 256);
+    return rt_mix_rgba(a, b, mix, 8);
+  }
+private: RtFuncNode* ms_; uint32_t start_ = 0; int len_ = -1; int fade_ = 0; int n_ = 1;
+};
+
+// TrWipeInX<MILLIS>: tip-to-base wipe
+class RtTrWipeInX : public RtTransNode {
+public:
+  explicit RtTrWipeInX(RtFuncNode* ms) : ms_(ms) {}
+  ~RtTrWipeInX() override { delete ms_; }
+  void begin() override { start_ = millis(); len_ = -1; fade_ = 0; n_ = 0; }
+  bool done() const override { return len_ >= 0 && (millis() - start_ >= (uint32_t)len_); }
+  void run(BladeBase* b) override {
+    if (len_ < 0) { ms_->run(b); len_ = ms_->getInteger(0); }
+    n_ = b->num_leds();
+    uint32_t el = millis() - start_;
+    fade_ = (len_ <= 0) ? 0 : (int)std::min((uint64_t)el * n_ * 256 / len_, (uint64_t)(n_ * 256));
+  }
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um& b, int led) override {
+    // Wipe from tip (n_-1) toward base (0): led >= threshold → show b
+    int threshold = n_ * 256 - fade_;
+    int f = led * 256 - threshold;
+    int mix = rt_clamp(f, 0, 256);
+    return rt_mix_rgba(a, b, mix, 8);
+  }
+private: RtFuncNode* ms_; uint32_t start_ = 0; int len_ = -1; int fade_ = 0; int n_ = 1;
+};
+
+// TrWaveX<COLOR, FADE_MS, WAVE_SIZE, WAVE_MS, CENTER>
+class RtTrWaveX : public RtTransNode {
+public:
+  RtTrWaveX(RtColorNode* color, RtFuncNode* fade_ms, RtFuncNode* wave_size,
+            RtFuncNode* wave_ms, RtFuncNode* center)
+    : color_(color), fade_ms_(fade_ms), wave_size_(wave_size), wave_ms_(wave_ms), center_(center) {}
+  ~RtTrWaveX() override {
+    delete color_; delete fade_ms_; delete wave_size_; delete wave_ms_; delete center_;
+  }
+  void begin() override { start_ms_ = millis(); fade_len_ = -1; wave_len_ = -1; center_val_ = 16384; size_val_ = 100; }
+  bool done() const override { return fade_len_ >= 0 && (millis() - start_ms_ >= (uint32_t)fade_len_); }
+  void run(BladeBase* b) override {
+    color_->run(b);
+    if (fade_len_ < 0) { fade_ms_->run(b); wave_size_->run(b); wave_ms_->run(b); center_->run(b);
+      fade_len_ = fade_ms_->getInteger(0); wave_len_ = wave_ms_->getInteger(0);
+      center_val_ = center_->getInteger(0); size_val_ = wave_size_->getInteger(0); }
+    n_ = b->num_leds();
+    uint32_t el = millis() - start_ms_;
+    mix_ = (fade_len_ <= 0) ? 0 : (int)(32768 - std::min((uint64_t)el * 32768 / fade_len_, (uint64_t)32768));
+    offset_ = (int)((uint64_t)el * 32768 / (wave_len_ > 0 ? wave_len_ : 400));
+  }
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um&, int led) override {
+    int dist = abs(center_val_ - led * 32768 / (n_ > 0 ? n_ : 1));
+    int N = abs(dist - offset_) * size_val_ >> 15;
+    int wave_mix = 0;
+    if (N < 32) wave_mix = rt_blast_hump[N] * mix_ >> 8;
+    RGBA_um wave_color = color_->getColor(led);
+    wave_color.alpha = (uint16_t)rt_clamp(wave_color.alpha * wave_mix >> 15, 0, 32768);
+    return rt_compose(a, wave_color);
+  }
+private:
+  RtColorNode* color_; RtFuncNode* fade_ms_; RtFuncNode* wave_size_;
+  RtFuncNode* wave_ms_; RtFuncNode* center_;
+  uint32_t start_ms_ = 0; int fade_len_ = -1, wave_len_ = -1;
+  int center_val_ = 16384, size_val_ = 100, mix_ = 0, offset_ = 0, n_ = 1;
+};
+
+// TrSparkX<COLOR, SIZE, MS, CENTER>: spark without fade
+class RtTrSparkX : public RtTransNode {
+public:
+  RtTrSparkX(RtColorNode* color, RtFuncNode* size, RtFuncNode* ms, RtFuncNode* center)
+    : color_(color), size_(size), ms_(ms), center_(center) {}
+  ~RtTrSparkX() override { delete color_; delete size_; delete ms_; delete center_; }
+  void begin() override { start_ms_ = millis(); len_ = -1; center_val_ = 0; size_val_ = 100; }
+  bool done() const override { return len_ >= 0 && (millis() - start_ms_ >= (uint32_t)len_); }
+  void run(BladeBase* b) override {
+    color_->run(b);
+    if (len_ < 0) { ms_->run(b); size_->run(b); center_->run(b);
+      len_ = ms_->getInteger(0); size_val_ = size_->getInteger(0); center_val_ = center_->getInteger(0); }
+    n_ = b->num_leds();
+    offset_ = (int)((uint64_t)(millis() - start_ms_) * 32768 / (len_ > 0 ? len_ : 400));
+  }
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um&, int led) override {
+    int dist = abs(center_val_ - led * 32768 / (n_ > 0 ? n_ : 1));
+    int N = abs(dist - offset_) * size_val_ >> 15;
+    int mix = 0;
+    if (N < 32) mix = rt_blast_hump[N] << 7;
+    RGBA_um sc = color_->getColor(led);
+    sc.alpha = (uint16_t)rt_clamp(mix, 0, 32768);
+    return rt_compose(a, sc);
+  }
+private:
+  RtColorNode* color_; RtFuncNode* size_; RtFuncNode* ms_; RtFuncNode* center_;
+  uint32_t start_ms_ = 0; int len_ = -1; int center_val_ = 0; int size_val_ = 100;
+  int offset_ = 0; int n_ = 1;
+};
+
+// TrWipeSparkTipX: wipe + leading spark, with lazy ms evaluation.
+// inward_=false: base-to-tip (ignition). inward_=true: tip-to-base (retraction).
+class RtTrWipeSparkTipX : public RtTransNode {
+public:
+  RtTrWipeSparkTipX(RtColorNode* spark, RtFuncNode* size, RtFuncNode* ms, bool inward)
+    : spark_(spark), size_(size), ms_(ms), inward_(inward) {}
+  ~RtTrWipeSparkTipX() override { delete spark_; delete size_; delete ms_; }
+  void begin() override { start_ = millis(); len_ = -1; n_ = 0; sz_ = 100; fade_ = 0; offset_ = 0; }
+  bool done() const override { return len_ >= 0 && (millis() - start_ >= (uint32_t)len_); }
+  void run(BladeBase* b) override {
+    spark_->run(b);
+    if (len_ < 0) {
+      ms_->run(b); len_ = ms_->getInteger(0);
+      if (len_ <= 0) len_ = inward_ ? 1000 : 300;
+      size_->run(b); sz_ = size_->getInteger(0);
+    }
+    n_ = b->num_leds();
+    uint32_t el = millis() - start_;
+    fade_ = (int)std::min((uint64_t)el * n_ * 256 / (uint32_t)len_, (uint64_t)(n_ * 256));
+    offset_ = (int)((uint64_t)el * 32768 / (uint32_t)len_);
+  }
+  RGBA_um getColor(const RGBA_um& from, const RGBA_um& to, int led) override {
+    // Wipe component
+    RGBA_um wipe = RGBA_um::Transparent();
+    if (!inward_) {
+      // Base-to-tip: leds with index <= fade_/256 are wiped (show 'to')
+      int mix = rt_clamp(fade_ - led * 256, 0, 256);
+      wipe = rt_mix_rgba(from, to, mix, 8);
+    } else {
+      // Tip-to-base: leds with index >= (n_-fade_/256) are wiped (show 'to')
+      int threshold = n_ * 256 - fade_;
+      int mix = rt_clamp(led * 256 - threshold, 0, 256);
+      wipe = rt_mix_rgba(from, to, mix, 8);
+    }
+    // Spark component: travels along wipe front
+    int center_val = inward_ ? 32768 : 0;
+    int led_frac = (n_ > 0) ? (led * 32768 / n_) : 0;
+    int dist = abs(center_val - led_frac);
+    int N = abs(dist - offset_) * sz_ >> 15;
+    if (N < 32) {
+      int mix_spark = rt_blast_hump[N] << 7;
+      RGBA_um sc = spark_->getColor(led);
+      sc.alpha = (uint16_t)rt_clamp(mix_spark, 0, 32768);
+      return rt_compose(wipe, sc);
+    }
+    return wipe;
+  }
+private:
+  RtColorNode* spark_; RtFuncNode* size_; RtFuncNode* ms_;
+  bool inward_;
+  uint32_t start_ = 0; int len_ = -1, n_ = 0, fade_ = 0, sz_ = 100, offset_ = 0;
+};
+
+// TrExtend<EXTEND_MS, TR>: run TR then hold for EXTEND_MS
+class RtTrExtend : public RtTransNode {
+public:
+  RtTrExtend(int extend_ms, RtTransNode* tr) : extend_ms_(extend_ms), tr_(tr) {}
+  ~RtTrExtend() override { delete tr_; }
+  void begin() override { tr_->begin(); hold_start_ = 0; holding_ = false; }
+  bool done() const override { return holding_ && (millis() - hold_start_ >= (uint32_t)extend_ms_); }
+  void run(BladeBase* b) override {
+    if (!holding_) {
+      tr_->run(b);
+      if (tr_->done()) { holding_ = true; hold_start_ = millis(); }
+    }
+  }
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um& b, int led) override {
+    if (holding_) return b;
+    return tr_->getColor(a, b, led);
+  }
+private: int extend_ms_; RtTransNode* tr_; uint32_t hold_start_ = 0; bool holding_ = false;
+};
+
+// TrDelay<MS>: wait then instantly switch
+class RtTrDelay : public RtTransNode {
+public:
+  explicit RtTrDelay(RtFuncNode* ms) : ms_(ms) {}
+  ~RtTrDelay() override { delete ms_; }
+  void begin() override { start_ = millis(); len_ = -1; }
+  bool done() const override { return len_ >= 0 && (millis() - start_ >= (uint32_t)len_); }
+  void run(BladeBase* b) override {
+    if (len_ < 0) { ms_->run(b); len_ = ms_->getInteger(0); }
+  }
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um& b, int) override {
+    return done() ? b : a;
+  }
+private: RtFuncNode* ms_; uint32_t start_ = 0; int len_ = -1;
+};
+
+// TrColorCycle<MS>: rainbow hue cycle
+class RtTrColorCycle : public RtTransNode {
+public:
+  explicit RtTrColorCycle(int ms) : ms_(ms) {}
+  void begin() override { start_ = millis(); }
+  bool done() const override { return (millis() - start_ >= (uint32_t)ms_); }
+  void run(BladeBase*) override {}
+  RGBA_um getColor(const RGBA_um&, const RGBA_um& b, int led) override {
+    uint32_t t = millis() - start_;
+    // cycle hue over time
+    int hue = (int)((uint64_t)t * 98304 / (ms_ > 0 ? ms_ : 1));
+    Color16 rainbow = Color16(Color8(255, 0, 0)).rotate(hue % 98304);
+    return RGBA_um(rainbow, false, 32768);
+  }
+private: int ms_; uint32_t start_ = 0;
+};
+
+// TrBoing<MS, N>: bounce N times
+class RtTrBoing : public RtTransNode {
+public:
+  RtTrBoing(int ms, int n) : ms_(ms), n_(n) {}
+  void begin() override { start_ = millis(); }
+  bool done() const override { return (millis() - start_ >= (uint32_t)ms_); }
+  void run(BladeBase*) override {}
+  RGBA_um getColor(const RGBA_um& a, const RGBA_um& b, int led) override {
+    uint32_t el = millis() - start_;
+    float t = (ms_ > 0) ? (float)el / ms_ : 1.0f;
+    // n_ bounces: use |sin(n*pi*t)|
+    float s = fabsf(sinf(t * (float)M_PI * n_));
+    int mix = (int)(s * 16384.0f);
+    return rt_mix_rgba(a, b, mix, 14);
+  }
+private: int ms_, n_; uint32_t start_ = 0;
+};
+
+// TrJoin<TR1, TR2>: run two transitions in parallel, compose results
+class RtTrJoin : public RtTransNode {
+public:
+  RtTrJoin(RtTransNode* a, RtTransNode* b) : a_(a), b_(b) {}
+  ~RtTrJoin() override { delete a_; delete b_; }
+  void begin() override { a_->begin(); b_->begin(); }
+  bool done() const override { return a_->done() && b_->done(); }
+  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); }
+  RGBA_um getColor(const RGBA_um& from, const RGBA_um& to, int led) override {
+    return rt_compose(a_->getColor(from, to, led), b_->getColor(from, to, led));
+  }
+private: RtTransNode* a_; RtTransNode* b_;
+};
+
+// TrConcat: chain transitions with optional intermediate colors
+class RtTrConcat : public RtTransNode {
+public:
+  struct Step { RtTransNode* tr; RtColorNode* intermediate; };  // intermediate = "to" for this step
+  ~RtTrConcat() override { for (auto& s : steps_) { delete s.tr; delete s.intermediate; } }
+  void addStep(RtTransNode* tr, RtColorNode* intermediate = nullptr) {
+    steps_.push_back({tr, intermediate});
+  }
+  void begin() override {
+    cur_ = 0;
+    if (!steps_.empty()) steps_[0].tr->begin();
+  }
+  bool done() const override {
+    return steps_.empty() || (cur_ >= (int)steps_.size() - 1 && steps_.back().tr->done());
+  }
+  void run(BladeBase* b) override {
+    if (steps_.empty()) return;
+    if (cur_ >= (int)steps_.size()) return;
+    // Only run intermediates relevant to the current step (cur-1 is "from", cur is "to")
+    if (cur_ > 0 && steps_[cur_-1].intermediate) steps_[cur_-1].intermediate->run(b);
+    if (steps_[cur_].intermediate) steps_[cur_].intermediate->run(b);
+    steps_[cur_].tr->run(b);
+    while (cur_ < (int)steps_.size() && steps_[cur_].tr->done()) {
+      ++cur_;
+      if (cur_ < (int)steps_.size()) { steps_[cur_].tr->begin(); steps_[cur_].tr->run(b); }
+    }
+  }
+  RGBA_um getColor(const RGBA_um& from, const RGBA_um& to, int led) override {
+    if (steps_.empty() || cur_ >= (int)steps_.size()) return to;
+    // "from" for current step
+    RGBA_um cur_from = (cur_ == 0) ? from
+      : (steps_[cur_-1].intermediate ? steps_[cur_-1].intermediate->getColor(led) : from);
+    // "to" for current step
+    RGBA_um cur_to = steps_[cur_].intermediate ? steps_[cur_].intermediate->getColor(led) : to;
+    return steps_[cur_].tr->getColor(cur_from, cur_to, led);
+  }
+private:
+  RtVec<Step> steps_; int cur_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Effect layer color nodes
+// ---------------------------------------------------------------------------
+
+// Helper: detect a new occurrence of an effect
+struct RtEffectDetector {
+  RtEffectDetector(EffectType t) : type(t), last_start(0) {}
+  EffectType type;
+  uint32_t last_start;
+  BladeEffect last_effect;
+  bool Detect(BladeBase*) {
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if (effects[i].type == type && effects[i].start_micros != last_start) {
+        last_start = effects[i].start_micros;
+        last_effect = effects[i];
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+// TransitionEffectL<TR, EFFECT>: transparent layer, plays TR when EFFECT fires
+class RtTransitionEffectL : public RtColorNode {
+public:
+  RtTransitionEffectL(RtTransNode* tr, EffectType effect)
+    : tr_(tr), detector_(effect) {}
+  ~RtTransitionEffectL() override { delete tr_; }
+  void run(BladeBase* b) override {
+    if (detector_.Detect(b)) { tr_->begin(); active_ = true; }
+    if (active_) {
+      tr_->run(b);
+      if (tr_->done()) active_ = false;
+    }
+  }
+  RGBA_um getColor(int led) override {
+    if (!active_) return RGBA_um::Transparent();
+    static const RGBA_um transparent = RGBA_um::Transparent();
+    return tr_->getColor(transparent, transparent, led);
+  }
+private: RtTransNode* tr_; RtEffectDetector detector_; bool active_ = false;
+};
+
+// TransitionEffect<C1, C2, TR_ON, TR_OFF, EFFECT>: stateful color
+class RtTransitionEffect : public RtColorNode {
+public:
+  RtTransitionEffect(RtColorNode* c1, RtColorNode* c2,
+                     RtTransNode* tr_on, RtTransNode* tr_off, EffectType effect)
+    : c1_(c1), c2_(c2), tr_on_(tr_on), tr_off_(tr_off), detector_(effect) {}
+  ~RtTransitionEffect() override {
+    delete c1_; delete c2_; delete tr_on_; delete tr_off_;
+  }
+  void run(BladeBase* b) override {
+    c1_->run(b); c2_->run(b);
+    if (detector_.Detect(b)) {
+      state_ = !state_;
+      (state_ ? tr_on_ : tr_off_)->begin();
+      active_ = true;
+    }
+    if (active_) {
+      (state_ ? tr_on_ : tr_off_)->run(b);
+      if ((state_ ? tr_on_ : tr_off_)->done()) active_ = false;
+    }
+  }
+  RGBA_um getColor(int led) override {
+    RGBA_um base = state_ ? c2_->getColor(led) : c1_->getColor(led);
+    if (!active_) return base;
+    RGBA_um alt = state_ ? c1_->getColor(led) : c2_->getColor(led);
+    RtTransNode* tr = state_ ? tr_on_ : tr_off_;
+    return tr->getColor(alt, base, led);
+  }
+private:
+  RtColorNode* c1_; RtColorNode* c2_;
+  RtTransNode* tr_on_; RtTransNode* tr_off_;
+  RtEffectDetector detector_; bool state_ = false; bool active_ = false;
+};
+
+// LockupTrL<COLOR, TR_BEGIN, TR_END, LOCKUP_TYPE>
+class RtLockupTrL : public RtColorNode {
+  enum State { IDLE, BEGINNING, ACTIVE, ENDING };
+public:
+  RtLockupTrL(RtColorNode* color, RtTransNode* tr_begin, RtTransNode* tr_end,
+               SaberBase::LockupType type)
+    : color_(color), tr_begin_(tr_begin), tr_end_(tr_end), type_(type) {}
+  ~RtLockupTrL() override { delete color_; delete tr_begin_; delete tr_end_; }
+  void run(BladeBase* b) override {
+    color_->run(b);
+    bool locked = SaberBase::LockupForBlade(b->GetBladeNumber()) == type_;
+    switch (state_) {
+      case IDLE:
+        if (locked) { state_ = BEGINNING; tr_begin_->begin(); tr_begin_->run(b); }
+        break;
+      case BEGINNING:
+        tr_begin_->run(b);
+        if (tr_begin_->done()) state_ = ACTIVE;
+        if (!locked) { state_ = ENDING; tr_end_->begin(); tr_end_->run(b); }
+        break;
+      case ACTIVE:
+        if (!locked) { state_ = ENDING; tr_end_->begin(); tr_end_->run(b); }
+        break;
+      case ENDING:
+        tr_end_->run(b);
+        if (tr_end_->done()) state_ = IDLE;
+        if (locked) { state_ = BEGINNING; tr_begin_->begin(); tr_begin_->run(b); }
+        break;
+    }
+  }
+  RGBA_um getColor(int led) override {
+    static const RGBA_um transparent = RGBA_um::Transparent();
+    RGBA_um c = color_->getColor(led);
+    switch (state_) {
+      case IDLE:    return transparent;
+      case ACTIVE:  return c;
+      case BEGINNING: return tr_begin_->getColor(transparent, c, led);
+      case ENDING:    return tr_end_->getColor(c, transparent, led);
+    }
+    return transparent;
+  }
+private:
+  RtColorNode* color_; RtTransNode* tr_begin_; RtTransNode* tr_end_;
+  SaberBase::LockupType type_; State state_ = IDLE;
+};
+
+// InOutTrL<TR_IN, TR_OUT, OFF_COLOR>: ignition/retraction layer
+class RtInOutTrL : public RtColorNode {
+  enum State { OFF_IDLE, IGNITING, ON_IDLE, RETRACTING };
+public:
+  RtInOutTrL(RtTransNode* tr_in, RtTransNode* tr_out, RtColorNode* off_color)
+    : tr_in_(tr_in), tr_out_(tr_out), off_(off_color) {}
+  ~RtInOutTrL() override { delete tr_in_; delete tr_out_; delete off_; }
+  void run(BladeBase* b) override {
+    off_->run(b);
+    bool on = b->is_on();
+    // On first run, if the blade is already on, skip the ignition animation.
+    if (!initialized_) {
+      initialized_ = true;
+      STDOUT.print("InOutTrL init: blade=");
+      STDOUT.print(b->GetBladeNumber());
+      STDOUT.print(" is_on=");
+      STDOUT.println(on ? "true" : "false");
+      if (on) { state_ = ON_IDLE; return; }
+    }
+    switch (state_) {
+      case OFF_IDLE:
+        if (on) { state_ = IGNITING; tr_in_->begin(); tr_in_->run(b); }
+        break;
+      case IGNITING:
+        tr_in_->run(b);
+        if (tr_in_->done()) state_ = ON_IDLE;
+        if (!on) { state_ = RETRACTING; tr_out_->begin(); tr_out_->run(b); }
+        break;
+      case ON_IDLE:
+        if (!on) { state_ = RETRACTING; tr_out_->begin(); tr_out_->run(b); }
+        break;
+      case RETRACTING:
+        tr_out_->run(b);
+        if (tr_out_->done()) state_ = OFF_IDLE;
+        if (on) { state_ = IGNITING; tr_in_->begin(); tr_in_->run(b); }
+        break;
+    }
+  }
+  RGBA_um getColor(int led) override {
+    static const RGBA_um transparent = RGBA_um::Transparent();
+    RGBA_um off_c = off_->getColor(led);
+    switch (state_) {
+      case OFF_IDLE:   return off_c;
+      case ON_IDLE:    return transparent;
+      case IGNITING:   return tr_in_->getColor(off_c, transparent, led);
+      case RETRACTING: return tr_out_->getColor(transparent, off_c, led);
+    }
+    return off_c;
+  }
+  bool is_fully_off() const { return state_ == OFF_IDLE; }
+private:
+  RtTransNode* tr_in_; RtTransNode* tr_out_; RtColorNode* off_;
+  State state_ = OFF_IDLE;
+  bool initialized_ = false;
+};
+
+// TransitionLoopL<TR>: continuously loops a transition
+class RtTransitionLoopL : public RtColorNode {
+public:
+  explicit RtTransitionLoopL(RtTransNode* tr) : tr_(tr) {}
+  ~RtTransitionLoopL() override { delete tr_; }
+  void run(BladeBase* b) override {
+    if (!started_) { tr_->begin(); started_ = true; }
+    tr_->run(b);
+    if (tr_->done()) { tr_->begin(); tr_->run(b); }
+  }
+  RGBA_um getColor(int led) override {
+    static const RGBA_um transparent = RGBA_um::Transparent();
+    return tr_->getColor(transparent, transparent, led);
+  }
+private: RtTransNode* tr_; bool started_ = false;
+};
+
+// SyncAltToVarianceL: transparent stub (sync is handled outside style)
+class RtSyncAltToVarianceL : public RtColorNode {
+public:
+  void run(BladeBase*) override {}
+  RGBA_um getColor(int) override { return RGBA_um::Transparent(); }
 };
 
 // ---------------------------------------------------------------------------
@@ -516,6 +1884,22 @@ static RtColorNode* sd_named_color(const char* name) {
     {"HaltRed", 255,  0, 19},
     {"Fuchsia", 255,  0,255}, {"GreenYellow",108,255,6},
     {"Chartreuse",55,255,0}, {"Tomato",255,31,15},
+    {"DarkOrange",255,140,0}, {"NavajoWhite",255,222,173}, {"Ivory",255,255,240},
+    {"LemonChiffon",255,250,205}, {"Wheat",245,222,179}, {"Bisque",255,228,196},
+    {"PeachPuff",255,218,185}, {"MistyRose",255,228,225}, {"Lavender",230,230,250},
+    {"Thistle",216,191,216}, {"Plum",221,160,221}, {"Violet",238,130,238},
+    {"Indigo",75,0,130}, {"SlateBlue",106,90,205}, {"MediumPurple",147,112,219},
+    {"Gold",255,215,0}, {"GoldenRod",218,165,32}, {"SaddleBrown",139,69,19},
+    {"Sienna",160,82,45}, {"Peru",205,133,63}, {"Tan",210,180,140},
+    {"Khaki",240,230,140}, {"DarkKhaki",189,183,107},
+    {"ForestGreen",34,139,34}, {"SeaGreen",46,139,87}, {"MediumSeaGreen",60,179,113},
+    {"LightSeaGreen",32,178,170}, {"Teal",0,128,128}, {"DarkCyan",0,139,139},
+    {"CornflowerBlue",100,149,237}, {"RoyalBlue",65,105,225}, {"Navy",0,0,128},
+    {"MidnightBlue",25,25,112}, {"DarkBlue",0,0,139}, {"MediumBlue",0,0,205},
+    {"SlateGray",112,128,144}, {"DimGray",105,105,105}, {"Gray",128,128,128},
+    {"Silver",192,192,192}, {"Crimson",220,20,60}, {"DarkRed",139,0,0},
+    {"Maroon",128,0,0}, {"Brown",165,42,42}, {"FireBrick",178,34,34},
+    {"DarkGreen",0,100,0}, {"OliveDrab",107,142,35}, {"Olive",128,128,0},
   };
   for (unsigned i = 0; i < sizeof(t)/sizeof(t[0]); ++i) {
     if (strcmp(name, t[i].n) == 0)
@@ -526,6 +1910,220 @@ static RtColorNode* sd_named_color(const char* name) {
 
 RtColorNode* SDStyleParser::namedColor(const char* name) {
   return sd_named_color(name);
+}
+
+// ---------------------------------------------------------------------------
+// Effect/lockup type helpers
+// ---------------------------------------------------------------------------
+
+EffectType SDStyleParser::parseEffectType() {
+  // skip optional "SaberBase::" prefix
+  skipWS();
+  const char* saved = s_;
+  char name[80]; readIdent(name, sizeof(name));
+  // handle EFFECT_XXX
+  struct { const char* n; EffectType t; } et[] = {
+    {"EFFECT_NONE",EFFECT_NONE},{"EFFECT_CLASH",EFFECT_CLASH},
+    {"EFFECT_BLAST",EFFECT_BLAST},{"EFFECT_FORCE",EFFECT_FORCE},
+    {"EFFECT_STAB",EFFECT_STAB},{"EFFECT_IGNITION",EFFECT_IGNITION},
+    {"EFFECT_RETRACTION",EFFECT_RETRACTION},{"EFFECT_PREON",EFFECT_PREON},
+    {"EFFECT_LOCKUP_BEGIN",EFFECT_LOCKUP_BEGIN},{"EFFECT_LOCKUP_END",EFFECT_LOCKUP_END},
+    {"EFFECT_DRAG_BEGIN",EFFECT_DRAG_BEGIN},{"EFFECT_DRAG_END",EFFECT_DRAG_END},
+    {"EFFECT_BATTERY_LEVEL",EFFECT_BATTERY_LEVEL},{"EFFECT_BOOT",EFFECT_BOOT},
+    {"EFFECT_NEWFONT",EFFECT_NEWFONT},{"EFFECT_CLASH_UPDATE",EFFECT_CLASH_UPDATE},
+    {"EFFECT_ALT_SOUND",EFFECT_ALT_SOUND},{"EFFECT_POWERSAVE",EFFECT_POWERSAVE},
+    {"EFFECT_USER1",EFFECT_USER1},{"EFFECT_USER2",EFFECT_USER2},
+    {"EFFECT_USER3",EFFECT_USER3},{"EFFECT_USER4",EFFECT_USER4},
+    {"EFFECT_USER5",EFFECT_USER5},{"EFFECT_USER6",EFFECT_USER6},
+    {"EFFECT_USER7",EFFECT_USER7},{"EFFECT_USER8",EFFECT_USER8},
+    {"EFFECT_FAST_ON",EFFECT_FAST_ON},
+  };
+  for (auto& e : et) if (!strcmp(name, e.n)) return e.t;
+  s_ = saved; // not recognized - restore
+  return EFFECT_NONE;
+}
+
+SaberBase::LockupType SDStyleParser::parseLockupType() {
+  // parse "SaberBase" "::" "LOCKUP_xxx" or just "LOCKUP_xxx"
+  skipWS();
+  char name[80]; readIdent(name, sizeof(name));
+  if (!strcmp(name, "SaberBase")) {
+    // consume "::"
+    skipWS(); if (s_+1 < end_ && s_[0] == ':' && s_[1] == ':') s_ += 2;
+    readIdent(name, sizeof(name));
+  }
+  if (!strcmp(name,"LOCKUP_NORMAL"))          return SaberBase::LOCKUP_NORMAL;
+  if (!strcmp(name,"LOCKUP_DRAG"))            return SaberBase::LOCKUP_DRAG;
+  if (!strcmp(name,"LOCKUP_ARMED"))           return SaberBase::LOCKUP_ARMED;
+  if (!strcmp(name,"LOCKUP_AUTOFIRE"))        return SaberBase::LOCKUP_AUTOFIRE;
+  if (!strcmp(name,"LOCKUP_MELT"))            return SaberBase::LOCKUP_MELT;
+  if (!strcmp(name,"LOCKUP_LIGHTNING_BLOCK")) return SaberBase::LOCKUP_LIGHTNING_BLOCK;
+  return SaberBase::LOCKUP_NORMAL;
+}
+
+// ---------------------------------------------------------------------------
+// parseTr
+// ---------------------------------------------------------------------------
+
+RtTransNode* SDStyleParser::parseTr() {
+  char name[64];
+  if (!readIdent(name, sizeof(name))) return new RtTrInstant();
+
+  if (!strcmp(name,"TrInstant")) return new RtTrInstant();
+
+  if (!strcmp(name,"TrFade") || !strcmp(name,"TrFadeX")) {
+    if (!eatChar('<')) return new RtTrFadeX(new RtIntConst(300));
+    RtFuncNode* ms = parseFuncOrInt(); eatChar('>');
+    return new RtTrFadeX(ms);
+  }
+  if (!strcmp(name,"TrSmoothFade") || !strcmp(name,"TrSmoothFadeX")) {
+    if (!eatChar('<')) return new RtTrSmoothFadeX(new RtIntConst(300));
+    RtFuncNode* ms = parseFuncOrInt(); eatChar('>');
+    return new RtTrSmoothFadeX(ms);
+  }
+  if (!strcmp(name,"TrWipe") || !strcmp(name,"TrWipeX")) {
+    if (!eatChar('<')) return new RtTrWipeX(new RtIntConst(300));
+    RtFuncNode* ms = parseFuncOrInt(); eatChar('>');
+    return new RtTrWipeX(ms);
+  }
+  if (!strcmp(name,"TrWipeIn") || !strcmp(name,"TrWipeInX")) {
+    if (!eatChar('<')) return new RtTrWipeInX(new RtIntConst(300));
+    RtFuncNode* ms = parseFuncOrInt(); eatChar('>');
+    return new RtTrWipeInX(ms);
+  }
+  // TrWipeSparkTip<SPARK_COLOR, MILLIS, [SIZE]>: lazy evaluation of ms (no parse-time eval)
+  if (!strcmp(name,"TrWipeSparkTip") || !strcmp(name,"TrWipeSparkTipX")) {
+    if (!eatChar('<')) return new RtTrWipeSparkTipX(new RtRgb(Color16(65535,65535,65535)), new RtIntConst(400), new RtIntConst(300), false);
+    RtColorNode* spark = parseColor(); eatChar(',');
+    RtFuncNode* ms = parseFuncOrInt();
+    RtFuncNode* sz = eatChar(',') ? parseFuncOrInt() : new RtIntConst(400);
+    skipToClose(); eatChar('>');
+    return new RtTrWipeSparkTipX(spark, sz, ms, false);
+  }
+  // TrWipeInSparkTip<SPARK_COLOR, MILLIS, [SIZE]>: lazy evaluation of ms
+  if (!strcmp(name,"TrWipeInSparkTip") || !strcmp(name,"TrWipeInSparkTipX")) {
+    if (!eatChar('<')) return new RtTrWipeSparkTipX(new RtRgb(Color16(65535,65535,65535)), new RtIntConst(400), new RtIntConst(1000), true);
+    RtColorNode* spark = parseColor(); eatChar(',');
+    RtFuncNode* ms = parseFuncOrInt();
+    RtFuncNode* sz = eatChar(',') ? parseFuncOrInt() : new RtIntConst(400);
+    skipToClose(); eatChar('>');
+    return new RtTrWipeSparkTipX(spark, sz, ms, true);
+  }
+  if (!strcmp(name,"TrWave") || !strcmp(name,"TrWaveX")) {
+    if (!eatChar('<')) return new RtTrInstant();
+    RtColorNode* color    = parseColor();       eatChar(',');
+    RtFuncNode*  fade_ms  = parseFuncOrInt();   eatChar(',');
+    RtFuncNode*  wave_sz  = parseFuncOrInt();   eatChar(',');
+    RtFuncNode*  wave_ms  = parseFuncOrInt();   eatChar(',');
+    RtFuncNode*  center   = parseFuncOrInt();
+    skipToClose(); eatChar('>');
+    return new RtTrWaveX(color, fade_ms, wave_sz, wave_ms, center);
+  }
+  if (!strcmp(name,"TrSpark") || !strcmp(name,"TrSparkX")) {
+    if (!eatChar('<')) return new RtTrInstant();
+    RtColorNode* color  = parseColor();     eatChar(',');
+    RtFuncNode*  sz     = parseFuncOrInt(); eatChar(',');
+    RtFuncNode*  ms     = parseFuncOrInt(); eatChar(',');
+    RtFuncNode*  center = parseFuncOrInt();
+    skipToClose(); eatChar('>');
+    return new RtTrSparkX(color, sz, ms, center);
+  }
+  if (!strcmp(name,"TrExtend")) {
+    if (!eatChar('<')) return new RtTrInstant();
+    int ext_ms = parseInt(); eatChar(',');
+    RtTransNode* inner = parseTr();
+    skipToClose(); eatChar('>');
+    return new RtTrExtend(ext_ms, inner);
+  }
+  if (!strcmp(name,"TrDelay") || !strcmp(name,"TrDelayX")) {
+    if (!eatChar('<')) return new RtTrDelay(new RtIntConst(0));
+    RtFuncNode* ms = parseFuncOrInt(); eatChar('>');
+    return new RtTrDelay(ms);
+  }
+  if (!strcmp(name,"TrColorCycle")) {
+    if (!eatChar('<')) return new RtTrColorCycle(1000);
+    int ms = parseInt(); skipToClose(); eatChar('>');
+    return new RtTrColorCycle(ms);
+  }
+  if (!strcmp(name,"TrBoing")) {
+    if (!eatChar('<')) return new RtTrBoing(300, 3);
+    int ms = parseInt(); eatChar(','); int n = parseInt();
+    eatChar('>');
+    return new RtTrBoing(ms, n);
+  }
+  if (!strcmp(name,"TrJoin")) {
+    if (!eatChar('<')) return new RtTrInstant();
+    RtTransNode* a = parseTr();
+    RtTransNode* result = a;
+    while (eatChar(',')) {
+      // peek: is this another Tr* ?
+      skipWS(); const char* saved = s_;
+      char peek[64]; readIdent(peek, sizeof(peek)); s_ = saved;
+      if (peek[0]=='T' && peek[1]=='r') {
+        result = new RtTrJoin(result, parseTr());
+      } else { break; }
+    }
+    skipToClose(); eatChar('>');
+    return result;
+  }
+  if (!strcmp(name,"TrConcat")) {
+    if (!eatChar('<')) return new RtTrInstant();
+    auto* concat = new RtTrConcat();
+    RtTransNode* pending_tr = nullptr;
+    while (true) {
+      skipWS();
+      if (peekChar('>')) break;
+      const char* saved = s_;
+      char peek[64]; readIdent(peek, sizeof(peek)); s_ = saved;
+      bool is_tr = (strncmp(peek,"Tr",2)==0);
+      if (is_tr) {
+        if (pending_tr) concat->addStep(pending_tr, nullptr);
+        pending_tr = parseTr();
+      } else {
+        // intermediate color: attach to pending_tr
+        RtColorNode* intermediate = parseColor();
+        if (pending_tr) {
+          concat->addStep(pending_tr, intermediate);
+          pending_tr = nullptr;
+        } else {
+          delete intermediate; // unexpected
+        }
+      }
+      if (!eatChar(',')) break;
+    }
+    if (pending_tr) concat->addStep(pending_tr, nullptr);
+    eatChar('>');
+    return concat;
+  }
+  // TrSelect<F, TR1, TR2, ...>: pick TR by index — use first
+  if (!strcmp(name,"TrSelect")) {
+    if (!eatChar('<')) return new RtTrInstant();
+    parseFuncOrInt(); // skip selector func
+    RtTransNode* first = nullptr;
+    while (eatChar(',')) {
+      skipWS(); const char* saved = s_;
+      char peek[64]; readIdent(peek, sizeof(peek)); s_ = saved;
+      if (strncmp(peek,"Tr",2)==0) {
+        RtTransNode* t = parseTr();
+        if (!first) first = t; else delete t;
+      } else break;
+    }
+    skipToClose(); eatChar('>');
+    return first ? first : new RtTrInstant();
+  }
+  // TrDoEffectAlwaysX<TR, EFFECT, ...> — play TR, ignore effect side effect
+  if (!strcmp(name,"TrDoEffectAlwaysX")) {
+    if (!eatChar('<')) return new RtTrInstant();
+    RtTransNode* tr = parseTr();
+    skipToClose(); eatChar('>');
+    return tr;
+  }
+  // Unknown transition
+  unknown_count_++;
+  STDOUT.print("SDStyle: unknown transition '"); STDOUT.print(name);
+  STDOUT.print("' at offset "); STDOUT.print((int)(s_ - start_)); STDOUT.println(" — TrInstant");
+  if (peekChar('<')) skipTemplateArgs();
+  return new RtTrInstant();
 }
 
 // ---------------------------------------------------------------------------
@@ -550,13 +2148,22 @@ RtColorNode* SDStyleParser::parseColor() {
   }
 
   // --- AlphaL -------------------------------------------------------
-  if (!strcmp(name, "AlphaL") || !strcmp(name, "AlphaMixL")) {
+  if (!strcmp(name, "AlphaL")) {
     if (!eatChar('<')) return new RtRgb(Color16());
     RtColorNode* color = parseColor();
     if (!eatChar(',')) { delete color; return new RtRgb(Color16()); }
     RtFuncNode* alpha = parseFunc();
     skipToClose(); eatChar('>');
     return new RtAlphaL(color, alpha);
+  }
+  // AlphaMixL<MIX_F, C1, C2>: Mix(F,C1,C2) with alpha=F — approximate as Mix
+  if (!strcmp(name, "AlphaMixL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode* f = parseFunc(); eatChar(',');
+    RtColorNode* c1 = parseColor();
+    RtColorNode* c2 = eatChar(',') ? parseColor() : new RtRgb(Color16(65535,65535,65535));
+    skipToClose(); eatChar('>');
+    return new RtMix(f, c1, c2);
   }
 
   // --- Mix ----------------------------------------------------------
@@ -646,15 +2253,10 @@ RtColorNode* SDStyleParser::parseColor() {
                                  new RtIntConst(in_ms)))));
   }
 
-  // InOutTr<BASE, OUT_TR, IN_TR, OFF> — simplified: just show BASE
-  // Full transition support can be added later.
-  if (!strcmp(name, "InOutTr") || !strcmp(name, "InOutTrL")) {
-    STDOUT.print("SDStyle: InOutTr not fully supported, using base only: ");
+  // InOutTr<BASE, OUT_TR, IN_TR, OFF> — simplified: just show BASE (no L suffix variant)
+  if (!strcmp(name, "InOutTr")) {
     if (!eatChar('<')) return new RtRgb(Color16());
-    // For InOutTr<BASE,...>, parse BASE and skip rest
-    // For InOutTrL<...>, no base arg (layer only) — return transparent
-    bool is_L = (name[8] == 'L');
-    RtColorNode* base = is_L ? (RtColorNode*)new RtRgb(Color16()) : parseColor();
+    RtColorNode* base = parseColor();
     skipToClose(); eatChar('>');
     return base;
   }
@@ -666,14 +2268,328 @@ RtColorNode* SDStyleParser::parseColor() {
     return new RtOverDriveWrap(inner);
   }
 
+  // --- Flicker/audio effects (L suffix = layer only, no suffix = base+layer) ---
+
+  auto make_flicker = [&](RtColorNode* base, RtColorNode* flicker_color, RtFuncNode* func) -> RtColorNode* {
+    if (base) return new RtCompose(base, new RtAlphaL(flicker_color, func));
+    return new RtAlphaL(flicker_color, func);
+  };
+
+  if (!strcmp(name,"AudioFlicker")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* a = parseColor(); eatChar(','); RtColorNode* b = parseColor(); eatChar('>');
+    return make_flicker(a, b, new RtNoisySoundLevel());
+  }
+  if (!strcmp(name,"AudioFlickerL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c = parseColor(); skipToClose(); eatChar('>');
+    return new RtAlphaL(c, new RtNoisySoundLevel());
+  }
+  if (!strcmp(name,"BrownNoiseFlicker")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* a = parseColor(); eatChar(','); RtColorNode* b = parseColor(); eatChar(',');
+    int grade = parseInt() * 128; eatChar('>');
+    return make_flicker(a, b, new RtBrownNoiseF(grade));
+  }
+  if (!strcmp(name,"BrownNoiseFlickerL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c = parseColor(); eatChar(','); RtFuncNode* grade = parseFuncOrInt(); eatChar('>');
+    return new RtAlphaL(c, grade);
+  }
+  if (!strcmp(name,"HumpFlicker")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* a = parseColor(); eatChar(','); RtColorNode* b = parseColor(); eatChar(',');
+    int width = parseInt(); eatChar('>');
+    return make_flicker(a, b, new RtHumpFlickerF(width));
+  }
+  if (!strcmp(name,"HumpFlickerL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c = parseColor(); eatChar(',');
+    int width = parseInt(); skipToClose(); eatChar('>');
+    return new RtAlphaL(c, new RtHumpFlickerF(width));
+  }
+  if (!strcmp(name,"RandomPerLEDFlicker")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* a = parseColor(); eatChar(','); RtColorNode* b = parseColor(); eatChar('>');
+    return make_flicker(a, b, new RtRandomPerLEDF());
+  }
+  if (!strcmp(name,"RandomPerLEDFlickerL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c = parseColor(); skipToClose(); eatChar('>');
+    return new RtAlphaL(c, new RtRandomPerLEDF());
+  }
+  if (!strcmp(name,"RandomFlicker")) {
+    // RandomFlicker<A,B[,N]>: mix A and B with per-frame random value
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* a = parseColor(); eatChar(','); RtColorNode* b = parseColor();
+    skipToClose(); eatChar('>');
+    return make_flicker(a, b, new RtRandomF());
+  }
+  if (!strcmp(name,"RandomFlickerL")) {
+    // RandomFlickerL<COLOR>: layer with per-frame random alpha
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c = parseColor(); skipToClose(); eatChar('>');
+    return new RtAlphaL(c, new RtRandomF());
+  }
+  if (!strcmp(name,"BlinkingL") || !strcmp(name,"Blinking")) {
+    // BlinkingL<COLOR, PERIOD_MS[, DUTY_PCT]>
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c = parseColor(); eatChar(',');
+    RtFuncNode* period = parseFuncOrInt();
+    int duty = 50;
+    if (eatChar(',')) duty = parseInt();
+    skipToClose(); eatChar('>');
+    return new RtAlphaL(c, new RtBlinkingF(period, duty));
+  }
+  if (!strcmp(name,"Strobe")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* a = parseColor(); eatChar(','); RtColorNode* b = parseColor(); eatChar(',');
+    int freq = parseInt(); eatChar(','); int duty = parseInt(); eatChar('>');
+    return make_flicker(a, b, new RtStrobeF(freq, duty));
+  }
+  if (!strcmp(name,"Pulsing")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* a = parseColor(); eatChar(','); RtColorNode* b = parseColor(); eatChar(',');
+    RtFuncNode* ms = parseFuncOrInt(); eatChar('>');
+    return make_flicker(a, b, new RtPulsingF(ms));
+  }
+
+  // --- Stripes -----------------------------------------------------
+  if (!strcmp(name,"Stripes") || !strcmp(name,"StripesX")) {
+    bool is_x = !strcmp(name,"StripesX");
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode* width = is_x ? parseFuncOrInt() : new RtIntConst(parseInt());
+    eatChar(',');
+    RtFuncNode* speed = is_x ? parseFuncOrInt() : new RtIntConst(parseInt());
+    RtVec<RtColorNode*> colors;
+    while (eatChar(',')) {
+      skipWS();
+      if (peekChar('>')) break;
+      colors.push_back(parseColor());
+    }
+    eatChar('>');
+    if (colors.empty()) { delete width; delete speed; return new RtRgb(Color16()); }
+    return new RtStripes(width, speed, rt_move(colors));
+  }
+
+  // --- RotateColorsX / RotateColors --------------------------------
+  if (!strcmp(name,"RotateColorsX") || !strcmp(name,"RotateColors")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode* angle = parseFuncOrInt(); eatChar(',');
+    RtColorNode* color = parseColor(); skipToClose(); eatChar('>');
+    return new RtRotateColorsX(angle, color);
+  }
+
+  // --- TransitionEffectL<TR, EFFECT> --------------------------------
+  if (!strcmp(name,"TransitionEffectL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtTransNode* tr = parseTr(); eatChar(',');
+    EffectType et = parseEffectType(); skipToClose(); eatChar('>');
+    return new RtTransitionEffectL(tr, et);
+  }
+  // TransitionEffect<C1, C2, TR_ON, TR_OFF, EFFECT>
+  if (!strcmp(name,"TransitionEffect")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c1 = parseColor(); eatChar(',');
+    RtColorNode* c2 = parseColor(); eatChar(',');
+    RtTransNode* tr_on  = parseTr(); eatChar(',');
+    RtTransNode* tr_off = parseTr(); eatChar(',');
+    EffectType et = parseEffectType(); skipToClose(); eatChar('>');
+    return new RtTransitionEffect(c1, c2, tr_on, tr_off, et);
+  }
+
+  // --- LockupTrL<COLOR, TR_BEGIN, TR_END, TYPE, [INT]> -------------
+  if (!strcmp(name,"LockupTrL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* color    = parseColor();  eatChar(',');
+    RtTransNode* tr_begin = parseTr();     eatChar(',');
+    RtTransNode* tr_end   = parseTr();     eatChar(',');
+    SaberBase::LockupType lt = parseLockupType();
+    skipToClose(); eatChar('>');
+    return new RtLockupTrL(color, tr_begin, tr_end, lt);
+  }
+
+  // --- InOutTrL<TR_IN, TR_OUT, [OFF_COLOR]> ------------------------
+  if (!strcmp(name,"InOutTrL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtTransNode* tr_in  = parseTr(); eatChar(',');
+    RtTransNode* tr_out = parseTr();
+    RtColorNode* off = eatChar(',') ? parseColor() : new RtRgb(Color16());
+    skipToClose(); eatChar('>');
+    return new RtInOutTrL(tr_in, tr_out, off);
+  }
+
+  // --- EffectSequence<EFFECT, C1, C2, ...> -------------------------
+  if (!strcmp(name,"EffectSequence")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    EffectType et = parseEffectType();
+    RtVec<RtColorNode*> colors;
+    while (eatChar(',')) {
+      skipWS(); if (peekChar('>')) break;
+      colors.push_back(parseColor());
+    }
+    eatChar('>');
+    if (colors.empty()) return new RtRgb(Color16());
+    return new RtEffectSequence(et, rt_move(colors));
+  }
+
+  // --- TransitionLoopL<TR> -----------------------------------------
+  if (!strcmp(name,"TransitionLoopL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtTransNode* tr = parseTr(); skipToClose(); eatChar('>');
+    return new RtTransitionLoopL(tr);
+  }
+
+  // --- SyncAltToVarianceL (no args) --------------------------------
+  if (!strcmp(name,"SyncAltToVarianceL") || !strcmp(name,"SyncAltToVarianceF")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtSyncAltToVarianceL();
+  }
+
+  // --- ColorSelect<F, TRANSITION, C1, C2, ...> ---------------------
+  if (!strcmp(name,"ColorSelect")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    delete parseFuncOrInt();  // selector func - ignored (use AltF via current_alternative)
+    RtVec<RtColorNode*> colors;
+    while (eatChar(',')) {
+      skipWS(); if (peekChar('>')) break;
+      const char* saved = s_; char peek[64]; readIdent(peek, sizeof(peek)); s_ = saved;
+      if (strncmp(peek,"Tr",2)==0) { RtTransNode* t = parseTr(); delete t; continue; }
+      colors.push_back(parseColor());
+    }
+    eatChar('>');
+    if (colors.empty()) return new RtRgb(Color16());
+    return new RtColorSelect(rt_move(colors));
+  }
+
+  // --- StyleFire / StaticFire --------------------------------------
+  if (!strcmp(name,"StyleFire") || !strcmp(name,"StaticFire")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c1 = parseColor(); eatChar(',');
+    RtColorNode* c2 = parseColor(); eatChar(',');
+    int delay = parseInt(); eatChar(',');  // ignored (startup delay)
+    int speed = parseInt();                // spread speed
+    int base_heat = 0, rand_heat = 100, cooling = 5;
+    if (eatChar(',')) {
+      // FireConfig<BASE,RAND,COOLING> or just integers
+      skipWS(); char fc[32]; readIdent(fc, sizeof(fc));
+      if (!strcmp(fc,"FireConfig")) {
+        if (eatChar('<')) { base_heat=parseInt(); eatChar(','); rand_heat=parseInt(); eatChar(','); cooling=parseInt(); eatChar('>'); }
+      } else { s_ -= strlen(fc); base_heat=parseInt(); }
+    }
+    skipToClose(); eatChar('>');
+    return new RtStyleFire(c1, c2, speed > 0 ? speed : 3, base_heat, rand_heat, cooling);
+  }
+
+  // --- Remap<F, COLOR> ---------------------------------------------
+  if (!strcmp(name,"Remap")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode* f = parseFuncOrInt(); eatChar(',');
+    RtColorNode* c = parseColor(); skipToClose(); eatChar('>');
+    return new RtRemap(f, c);
+  }
+
+  // --- Responsive effect layers (simplified) -----------------------
+
+  // ResponsiveLightningBlockL<COLOR, TR1, TR2, [INT]>
+  // → LockupTrL of LOCKUP_LIGHTNING_BLOCK with simplified color
+  if (!strcmp(name,"ResponsiveLightningBlockL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* color = parseColor(); eatChar(',');
+    RtTransNode* tr1   = parseTr();    eatChar(',');
+    RtTransNode* tr2   = parseTr();
+    skipToClose(); eatChar('>');
+    return new RtLockupTrL(color, tr1, tr2, SaberBase::LOCKUP_LIGHTNING_BLOCK);
+  }
+
+  // ResponsiveStabL<COLOR, [TR_IN, TR_OUT]>
+  // → TransitionEffectL for EFFECT_STAB
+  if (!strcmp(name,"ResponsiveStabL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* color = parseColor();
+    RtTransNode* tr_in = eatChar(',') ? parseTr() : (RtTransNode*)new RtTrWipeX(new RtIntConst(200));
+    RtTransNode* tr_out = eatChar(',') ? parseTr() : (RtTransNode*)new RtTrFadeX(new RtIntConst(400));
+    skipToClose(); eatChar('>');
+    // Build a TrConcat: tr_in (show color) tr_out
+    auto* concat = new RtTrConcat();
+    concat->addStep(tr_in, color);
+    concat->addStep(tr_out, nullptr);
+    return new RtTransitionEffectL(concat, EFFECT_STAB);
+  }
+
+  // ResponsiveBlastL, ResponsiveBlastWaveL, ResponsiveBlastFadeL
+  // → TransitionEffectL for EFFECT_BLAST using TrWaveX
+  if (!strcmp(name,"ResponsiveBlastL") || !strcmp(name,"ResponsiveBlastWaveL") ||
+      !strcmp(name,"ResponsiveBlastFadeL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* color = parseColor();
+    skipToClose(); eatChar('>');
+    // Default wave: 400ms fade, size 100, 400ms wave, center from EffectPosition
+    auto* wave = new RtTrWaveX(color,
+      new RtIntConst(400), new RtIntConst(100), new RtIntConst(400),
+      new RtEffectPosition(EFFECT_BLAST));
+    return new RtTransitionEffectL(wave, EFFECT_BLAST);
+  }
+
+  // BlastL<COLOR, [FADE, SIZE]>
+  if (!strcmp(name,"BlastL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* color = parseColor();
+    int fade = 200, size = 100;
+    if (eatChar(',')) { fade = parseInt(); if (eatChar(',')) size = parseInt(); }
+    skipToClose(); eatChar('>');
+    return new RtAlphaL(color, new RtBlastF(fade, size, 400, EFFECT_BLAST));
+  }
+
+  // LocalizedClashL<COLOR, CLASH_MILLIS=40, WIDTH_PCT=50, EFFECT=EFFECT_CLASH>
+  // Args 2 and 3 are integers, not transitions!
+  if (!strcmp(name,"LocalizedClashL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* color = parseColor();
+    int millis = 40, width_pct = 50;
+    EffectType effect = EFFECT_CLASH;
+    if (eatChar(',')) { millis = parseInt();
+      if (eatChar(',')) { width_pct = parseInt();
+        if (eatChar(',')) effect = parseEffectType(); } }
+    skipToClose(); eatChar('>');
+    return new RtAlphaL(color, new RtLocalizedClashF(millis, width_pct, effect));
+  }
+
+  // ResponsiveClashL<COLOR, TR1, TR2, ...>
+  // → TransitionEffectL for EFFECT_CLASH
+  if (!strcmp(name,"ResponsiveClashL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* color = parseColor(); eatChar(',');
+    RtTransNode* tr1 = parseTr(); eatChar(',');
+    RtTransNode* tr2 = parseTr();
+    skipToClose(); eatChar('>');
+    auto* concat = new RtTrConcat();
+    concat->addStep(tr1, color);
+    concat->addStep(tr2, nullptr);
+    return new RtTransitionEffectL(concat, EFFECT_CLASH);
+  }
+
+  // LayerFunctions<...>: compose all children
+  if (!strcmp(name,"LayerFunctions")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base = parseColor();
+    while (eatChar(',')) base = new RtCompose(base, parseColor());
+    eatChar('>');
+    return base;
+  }
+
+  // AlphaMixL: alias for AlphaL (already handled above, but add second form)
+  // (handled in existing AlphaL branch via strcmp("AlphaMixL"))
+
   // --- Named colors (no template args) ----------------------------
   RtColorNode* nc = sd_named_color(name);
   if (nc) return nc;
 
   // --- Unknown: skip any template args and return black -----------
+  unknown_count_++;
   STDOUT.print("SDStyle: unknown color '");
   STDOUT.print(name);
-  STDOUT.println("' — using Black");
+  STDOUT.print("' at offset "); STDOUT.print((int)(s_ - start_)); STDOUT.println(" — using Black");
   if (peekChar('<')) skipTemplateArgs();
   return new RtRgb(Color16());
 }
@@ -785,23 +2701,252 @@ RtFuncNode* SDStyleParser::parseFunc() {
     return new RtBladeAngle(new RtIntConst(0), new RtIntConst(32768));
   }
 
-  // HumpFlickerF<WIDTH> — simplified: random single-value function
+  // HumpFlickerF<WIDTH>
   if (!strcmp(name, "HumpFlickerF") || !strcmp(name, "HumpFlickerFX")) {
-    if (peekChar('<')) skipTemplateArgs();
-    // Return a zero-constant as a safe stub; actual hump flicker needs per-frame random
-    return new RtIntConst(0);
+    if (!eatChar('<')) return new RtHumpFlickerF(40);
+    int w = parseInt(); skipToClose(); eatChar('>');
+    return new RtHumpFlickerF(w);
   }
 
-  // RandomF / RandomPerLEDF — stub
-  if (!strcmp(name, "RandomF") || !strcmp(name, "RandomPerLEDF")) {
+  // RandomPerLEDF
+  if (!strcmp(name, "RandomPerLEDF") || !strcmp(name, "RandomF")) {
     if (peekChar('<')) skipTemplateArgs();
-    return new RtIntConst(16384);
+    return new RtRandomPerLEDF();
+  }
+
+  // BrownNoiseF<GRADE>
+  if (!strcmp(name, "BrownNoiseF")) {
+    if (!eatChar('<')) return new RtBrownNoiseF(128);
+    int grade = parseInt(); eatChar('>');
+    return new RtBrownNoiseF(grade);
+  }
+
+  // StrobeF<FREQ, DUTY_MS>
+  if (!strcmp(name, "StrobeF")) {
+    if (!eatChar('<')) return new RtStrobeF(50, 1);
+    int freq = parseInt(); eatChar(','); int duty = parseInt(); eatChar('>');
+    return new RtStrobeF(freq, duty);
+  }
+
+  // PulsingF<MS>
+  if (!strcmp(name, "PulsingF")) {
+    if (!eatChar('<')) return new RtPulsingF(new RtIntConst(1000));
+    RtFuncNode* ms = parseFuncOrInt(); eatChar('>');
+    return new RtPulsingF(ms);
+  }
+
+  // Variation
+  if (!strcmp(name, "Variation")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtVariation();
+  }
+
+  // AltF
+  if (!strcmp(name, "AltF")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtAltF();
+  }
+
+  // NoisySoundLevel / NoisySoundLevelCompat / SoundLevel
+  if (!strcmp(name, "NoisySoundLevel") || !strcmp(name, "NoisySoundLevelCompat") || !strcmp(name, "SoundLevel")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtNoisySoundLevel();
+  }
+
+  // BatteryLevel
+  if (!strcmp(name, "BatteryLevel")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtBatteryLevel();
+  }
+
+  // RampF
+  if (!strcmp(name, "RampF")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtRampF();
+  }
+
+  // SwingSpeed<MAX>
+  if (!strcmp(name, "SwingSpeed")) {
+    if (!eatChar('<')) return new RtSwingSpeed(new RtIntConst(1000));
+    RtFuncNode* mx = parseFuncOrInt(); eatChar('>');
+    return new RtSwingSpeed(mx);
+  }
+
+  // TwistAngle<[N, OFFSET]>
+  if (!strcmp(name, "TwistAngle")) {
+    if (!peekChar('<')) return new RtTwistAngle(2);
+    eatChar('<');
+    int n = 2;
+    if (!peekChar('>')) { n = parseInt(); skipToClose(); }
+    eatChar('>');
+    return new RtTwistAngle(n);
+  }
+
+  // Sin<RPM, [LOW, HIGH]>
+  if (!strcmp(name, "Sin")) {
+    if (!eatChar('<')) return new RtIntConst(16384);
+    RtFuncNode* rpm = parseFuncOrInt();
+    RtFuncNode* lo  = eatChar(',') ? parseFuncOrInt() : new RtIntConst(0);
+    RtFuncNode* hi  = eatChar(',') ? parseFuncOrInt() : new RtIntConst(32768);
+    skipToClose(); eatChar('>');
+    return new RtSin(rpm, lo, hi);
+  }
+
+  // SlowNoise<SPEED>
+  if (!strcmp(name, "SlowNoise")) {
+    if (!eatChar('<')) return new RtSlowNoise(new RtIntConst(2000));
+    RtFuncNode* sp = parseFuncOrInt(); eatChar('>');
+    return new RtSlowNoise(sp);
+  }
+
+  // ClashImpactF<[MIN, MAX]>
+  if (!strcmp(name, "ClashImpactF")) {
+    int mn = 200, mx = 1600;
+    if (peekChar('<')) { eatChar('<'); mn = parseInt(); eatChar(','); mx = parseInt(); eatChar('>'); }
+    return new RtClashImpactF(mn, mx);
+  }
+
+  // WavLen<[EFFECT]>
+  if (!strcmp(name, "WavLen")) {
+    EffectType et = EFFECT_NONE;
+    if (peekChar('<')) { eatChar('<'); et = parseEffectType(); skipToClose(); eatChar('>'); }
+    return new RtWavLen(et);
+  }
+
+  // Percentage<A, B>: B% of A
+  if (!strcmp(name, "Percentage")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* a = parseFuncOrInt(); eatChar(',');
+    int pct = parseInt(); eatChar('>');
+    return new RtMult(a, new RtIntConst(pct * 32768 / 100));
+  }
+
+  // IsLessThan<A, B>
+  if (!strcmp(name, "IsLessThan")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* a = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* b = parseFuncOrInt(); eatChar('>');
+    return new RtIsLessThan(a, b);
+  }
+
+  // IsGreaterThan<A, B>
+  if (!strcmp(name, "IsGreaterThan")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* a = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* b = parseFuncOrInt(); eatChar('>');
+    return new RtIsGreaterThan(a, b);
+  }
+
+  // Sum<A, B>
+  if (!strcmp(name, "Sum")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* a = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* b = parseFuncOrInt(); eatChar('>');
+    return new RtSum(a, b);
+  }
+
+  // Mult<A, B>
+  if (!strcmp(name, "Mult")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* a = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* b = parseFuncOrInt(); eatChar('>');
+    return new RtMult(a, b);
+  }
+
+  // ModF<F, N>
+  if (!strcmp(name, "ModF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* n = parseFuncOrInt(); eatChar('>');
+    return new RtModF(f, n);
+  }
+
+  // HoldPeakF<F, HOLD_MS, SPEED>
+  if (!strcmp(name, "HoldPeakF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f    = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* hold = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* sp   = parseFuncOrInt(); eatChar('>');
+    return new RtHoldPeakF(f, hold, sp);
+  }
+
+  // Trigger<EFFECT, UP_MS, DOWN_MS, ZERO_VALUE>
+  if (!strcmp(name, "Trigger")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    EffectType et = parseEffectType(); eatChar(',');
+    RtFuncNode* up   = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* down = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* zero = parseFuncOrInt(); skipToClose(); eatChar('>');
+    return new RtTrigger(et, up, down, zero);
+  }
+
+  // EffectRandomF<EFFECT>
+  if (!strcmp(name, "EffectRandomF") || !strcmp(name, "EffectPulseF")) {
+    if (!eatChar('<')) return new RtEffectRandomF(EFFECT_BLAST);
+    EffectType et = parseEffectType(); skipToClose(); eatChar('>');
+    return new RtEffectRandomF(et);
+  }
+
+  // EffectPosition<EFFECT>
+  if (!strcmp(name, "EffectPosition")) {
+    if (!eatChar('<')) return new RtEffectPosition(EFFECT_BLAST);
+    EffectType et = parseEffectType(); skipToClose(); eatChar('>');
+    return new RtEffectPosition(et);
+  }
+
+  // BlastF<[FADE, SIZE, MS, EFFECT]>
+  if (!strcmp(name, "BlastF")) {
+    int fade = 200, size = 100, ms = 400;
+    EffectType et = EFFECT_BLAST;
+    if (peekChar('<')) {
+      eatChar('<');
+      fade = parseInt(); eatChar(','); size = parseInt(); eatChar(','); ms = parseInt();
+      if (eatChar(',')) et = parseEffectType();
+      skipToClose(); eatChar('>');
+    }
+    return new RtBlastF(fade, size, ms, et);
+  }
+
+  // IgnitionTime<DEFAULT>
+  if (!strcmp(name, "IgnitionTime")) {
+    int def = 300;
+    if (peekChar('<')) { eatChar('<'); def = parseInt(); eatChar('>'); }
+    return new RtIgnitionTime(def);
+  }
+
+  // RetractionTime<DEFAULT>
+  if (!strcmp(name, "RetractionTime")) {
+    int def = 0;
+    if (peekChar('<')) { eatChar('<'); def = parseInt(); eatChar('>'); }
+    return new RtRetractionTime(def);
+  }
+
+  // LayerFunctions<F1,F2,...>: multiply all function values together (used as alpha)
+  if (!strcmp(name, "LayerFunctions")) {
+    if (!eatChar('<')) return new RtIntConst(32768);
+    RtFuncNode* result = parseFuncOrInt();
+    while (eatChar(',')) {
+      skipWS();
+      if (peekChar('>')) break;
+      result = new RtMult(result, parseFuncOrInt());
+    }
+    eatChar('>');
+    return result;
+  }
+
+  // BendTimePowX / BendTimePowInvX / ReverseTimeX: passthrough (ignore bend)
+  if (!strcmp(name, "BendTimePowX") || !strcmp(name, "BendTimePowInvX") || !strcmp(name, "ReverseTimeX")) {
+    if (!eatChar('<')) return new RtIntConst(300);
+    RtFuncNode* ms = parseFuncOrInt();
+    skipToClose(); eatChar('>');
+    return ms;
   }
 
   // Unknown function
+  unknown_count_++;
   STDOUT.print("SDStyle: unknown function '");
   STDOUT.print(name);
-  STDOUT.println("' — using Int<0>");
+  STDOUT.print("' at offset "); STDOUT.print((int)(s_ - start_)); STDOUT.println(" — using Int<0>");
   if (peekChar('<')) skipTemplateArgs();
   return new RtIntConst(0);
 }
@@ -823,8 +2968,8 @@ public:
       return new RuntimeBladeStyle(new RtRgb(Color16()));
     }
 
-    // Read up to 4 KB; styles beyond that should be split across presets.
-    static const int kMaxStyleBytes = 4096;
+    // Read up to 16 KB per style file.
+    static const int kMaxStyleBytes = 16384;
     char* buf = (char*)malloc(kMaxStyleBytes);
     if (!buf) {
       STDOUT.println("SDStyle: out of memory");
@@ -840,11 +2985,28 @@ public:
       --len;
     buf[len] = '\0';
 
+    STDOUT.print("SDStyle: loaded '"); STDOUT.print(path_);
+    STDOUT.print("' ("); STDOUT.print(len); STDOUT.println(" bytes)");
+    // Print first 80 chars so you can verify the file content in Serial Monitor
+    STDOUT.print("SDStyle: content[0..80]: '");
+    for (int i = 0; i < 80 && i < len; i++) {
+      char c = buf[i];
+      if (c == '\r' || c == '\n') STDOUT.print(' ');
+      else STDOUT.print(c);
+    }
+    STDOUT.println("'");
+
     SDStyleParser parser(buf, len);
     RtColorNode* root = parser.parseColor();
     free(buf);
 
-    STDERR << "SDStyle loaded: " << path_ << " (" << len << " bytes)\n";
+    if (parser.unknown_count() == 0) {
+      STDOUT.print("SDStyle: parse OK — '"); STDOUT.print(path_); STDOUT.println("'");
+    } else {
+      STDOUT.print("SDStyle: parse done with ");
+      STDOUT.print(parser.unknown_count());
+      STDOUT.print(" unknown token(s) — '"); STDOUT.print(path_); STDOUT.println("'");
+    }
     return new RuntimeBladeStyle(root);
   }
 
