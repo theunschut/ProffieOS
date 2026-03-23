@@ -506,6 +506,7 @@ struct is_same_type<T, T> { static const bool value = true; };
 #include "styles/colors.h"
 #include "styles/mix.h"
 #include "styles/style_ptr.h"
+#include "styles/sd_style.h"
 #include "styles/file.h"
 #include "styles/stripes.h"
 #include "styles/random_blink.h"
