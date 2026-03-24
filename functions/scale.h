@@ -25,7 +25,7 @@ public:
   int getInteger(int led) {
     return (f_.getInteger(led) * mul_ >> 15) + add_;
   }
-private:
+protected:
   PONUA F f_;
   PONUA SVFWrapper<A> a_;
   PONUA SVFWrapper<B> b_;
@@ -42,7 +42,7 @@ public:
   int getInteger(int led) {
     return (f_.getInteger(led) * (B - A) >> 15) + A;
   }
-private:
+protected:
   PONUA F f_;
 };
 

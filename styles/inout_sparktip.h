@@ -22,7 +22,7 @@ public:
     return true;
   }
 
-private:
+protected:
   T base_;
   bool on_;
   int thres = 0;

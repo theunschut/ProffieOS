@@ -32,7 +32,7 @@ public:
     }
   }
   bool is_on() const override { return is_on_; }
-private:
+protected:
   bool is_on_ = false;
   bool waiting_ = false;
   uint32_t wait_start_time_;

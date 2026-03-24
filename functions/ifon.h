@@ -24,7 +24,7 @@ public:
     return on_ ? ifon_.getInteger(led) : ifoff_.getInteger(led);
   }
 
-private:
+protected:
   PONUA IFON ifon_;
   PONUA IFOFF ifoff_;
   bool on_;

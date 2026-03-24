@@ -20,7 +20,7 @@ public:
     return (f_.getInteger(led) < v_.getInteger(led)) << 15;
   }
 
-private:
+protected:
   PONUA F f_;
   PONUA V v_;
 };

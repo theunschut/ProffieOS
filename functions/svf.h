@@ -33,7 +33,7 @@ class SVFWrapper {
 public:
   FunctionRunResult run(BladeBase* blade) { return RunFunction(&f_, blade); }
   int calculate(BladeBase* blade) { return f_.getInteger(0); }
-private:
+public:
   PONUA FUNC f_;
 };
 

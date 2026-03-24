@@ -27,7 +27,7 @@ public:
     return LayerRunResult::UNKNOWN;
   }
 
-private:
+protected:
   PONUA COLOR color_;
   PONUA ALPHA alpha_;
 

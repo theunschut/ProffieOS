@@ -37,7 +37,7 @@ public:
     }
     return LayerRunResult::UNKNOWN;
   }
-private:
+protected:
   PONUA A a_;
   PONUA B b_;
   PONUA F f_;
@@ -91,10 +91,10 @@ public:
     colors_.run(blade);
     f_.run(blade);
   }
-private:
+protected:
   PONUA MixHelper<A, B, COLORS...> colors_;
   PONUA F f_;
-public:  
+public:
   auto getColor(int led) -> decltype(colors_.getColor(1,1)) {
     int x = f_.getInteger(led);
     x *= (sizeof...(COLORS) + 1);

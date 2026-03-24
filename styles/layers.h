@@ -32,7 +32,7 @@ public:
     }
     return LayerRunResult::UNKNOWN;
   }
-private:
+protected:
   PONUA BASE base_;
   PONUA L1 layer_;
 public:
@@ -59,7 +59,7 @@ public:
     }
     return LayerRunResult::UNKNOWN;
   }
-private:
+protected:
   PONUA L1 layer_;
   SimpleColor dealpha(const SimpleColor& color) { return color; }
   OverDriveColor dealpha(const OverDriveColor& color) { return color; }

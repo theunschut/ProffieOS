@@ -17,7 +17,7 @@ public:
     return a_.getInteger(led) + b_.getInteger(led);
   }
 
-private:
+protected:
   PONUA A a_;
   PONUA B b_;
 };

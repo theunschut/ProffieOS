@@ -20,7 +20,7 @@ public:
       return MOD(f_.getInteger(led), max);
     }
   }
-private:
+protected:
   PONUA F f_;
   PONUA MAX max_;
 };

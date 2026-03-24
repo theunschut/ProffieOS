@@ -10,7 +10,7 @@
 //   StyleFromSD("font/style1.style")
 //
 // The file is parsed at runtime: no recompilation needed to change styles.
-// Supports ~70 primitives. Unknown tokens fall back to black (with STDOUT log).
+// Supports most standard ProffieOS style primitives. Unknown tokens fall back to black (with STDOUT log).
 
 #include "blade_style.h"
 #include "../common/file_reader.h"
@@ -18,6 +18,36 @@
 #include "../blades/blade_base.h"
 #include "../common/arg_parser.h"
 #include "../common/sin_table.h"
+#include "../functions/ifon.h"       // InOutFuncSVFBase, InOutHelperFBase; transitively trigger.h
+#include "../functions/bump.h"       // BumpBase
+#include "../functions/smoothstep.h" // SmoothStepBase
+#include "alpha.h"                   // AlphaL
+#include "../functions/sum.h"        // SumBase
+#include "../functions/mult.h"       // MultBase
+#include "../functions/subtract.h"   // SubtractBase
+#include "../functions/mod.h"        // ModBase
+#include "../functions/islessthan.h" // IsLessThanBase
+#include "rgb_arg.h"                 // RgbArgBase
+#include "../functions/sparkle.h"    // SparkleBase
+#include "../common/range.h"         // Range (used by ColorCycleBase::getMix, CylonBase::getColor)
+#include "color_cycle.h"             // ColorCycleBase
+#include "cylon.h"                   // CylonBase
+#include "../blades/blade_wrapper.h"  // BladeWrapper (used by RtIgnitionDelay, RtRetractionDelay)
+#include "inout_sparktip.h"           // InOutSparkTipX base
+#include "ignition_delay.h"           // IgnitionDelayBase
+#include "retraction_delay.h"         // RetractionDelayBase
+
+// MixColors overload for RGBA_um — needed so InOutSparkTipX<RtColorAdapter,...>::getColor()
+// can resolve its decltype return type when instantiated with runtime adapters.
+inline RGBA_um MixColors(RGBA_um a, RGBA_um b, int x, int shift) {
+  int ax = (1 << shift) - x;
+  return RGBA_um(
+    ((a.c * (uint16_t)ax) + (b.c * (uint16_t)x)) >> shift,
+    x > (1 << (shift - 1)) ? b.overdrive : a.overdrive,
+    (uint16_t)(((uint32_t)a.alpha * (uint16_t)ax + (uint32_t)b.alpha * (uint16_t)x
+                + ((1 << shift) - 1)) >> shift)
+  );
+}
 // Minimal vector replacement — no C++ exceptions, works on bare metal.
 template<typename T>
 class RtVec {
@@ -97,6 +127,25 @@ static inline int rt_clamp(int x, int lo, int hi) {
 }
 
 // ---------------------------------------------------------------------------
+// Adapter types: wrap Rt* nodes to satisfy ProffieOS template parameters
+// ---------------------------------------------------------------------------
+
+// RtFuncAdapter: wraps RtFuncNode* so it can serve as a FUNCTION template arg.
+struct RtFuncAdapter {
+  RtFuncNode* node_ = nullptr;
+  void run(BladeBase* b) { if (node_) node_->run(b); }
+  int getInteger(int led) { return node_ ? node_->getInteger(led) : 0; }
+  int calculate(BladeBase*) { return node_ ? node_->getInteger(0) : 0; }
+};
+
+// RtColorAdapter: wraps RtColorNode* so it can serve as a COLOR template arg.
+struct RtColorAdapter {
+  RtColorNode* node_ = nullptr;
+  void run(BladeBase* b) { if (node_) node_->run(b); }
+  RGBA_um getColor(int led) { return node_ ? node_->getColor(led) : RGBA_um::Transparent(); }
+};
+
+// ---------------------------------------------------------------------------
 // Color nodes
 // ---------------------------------------------------------------------------
 
@@ -111,22 +160,17 @@ private:
   RGBA_um pixel_;
 };
 
-// AlphaL<COLOR, ALPHA_FUNC>
-class RtAlphaL : public RtColorNode {
+// AlphaL<COLOR, ALPHA_FUNC>: wraps AlphaL<RtColorAdapter, RtFuncAdapter> — reuses upstream alpha logic.
+// RGBA_um::operator*(uint16_t) only scales the alpha channel (unmultiplied semantics), so
+// AlphaL::getColor(led) = color_.getColor(led) * alpha is exactly equivalent to our hand-written version.
+// AlphaL::run() calls RunLayer/RunFunction which both gracefully return UNKNOWN for void run().
+class RtAlphaL : public RtColorNode, public AlphaL<RtColorAdapter, RtFuncAdapter> {
+  using Base = AlphaL<RtColorAdapter, RtFuncAdapter>;
 public:
-  RtAlphaL(RtColorNode* color, RtFuncNode* alpha) : color_(color), alpha_(alpha) {}
-  ~RtAlphaL() override { delete color_; delete alpha_; }
-  void run(BladeBase* blade) override { color_->run(blade); alpha_->run(blade); }
-  RGBA_um getColor(int led) override {
-    int a = alpha_->getInteger(led);
-    if (!a) return RGBA_um::Transparent();
-    RGBA_um c = color_->getColor(led);
-    c.alpha = (uint32_t)c.alpha * (uint16_t)a >> 15;
-    return c;
-  }
-private:
-  RtColorNode* color_;
-  RtFuncNode* alpha_;
+  RtAlphaL(RtColorNode* color, RtFuncNode* alpha) { color_.node_ = color; alpha_.node_ = alpha; }
+  ~RtAlphaL() override { delete color_.node_; delete alpha_.node_; }
+  void run(BladeBase* blade) override { Base::run(blade); }
+  RGBA_um getColor(int led) override { return Base::getColor(led); }
 };
 
 // Compose: paint layer on top of base  (Layers<> expands to nested RtCompose)
@@ -190,30 +234,15 @@ private:
 };
 
 // RgbArg<N, DEFAULT>: read color from arg slot N, fall back to DEFAULT
-class RtRgbArg : public RtColorNode {
+// RgbArg<N, DEFAULT>: wraps RgbArgBase to reuse its init() / arg-parsing logic.
+class RtRgbArg : public RtColorNode, public RgbArgBase {
 public:
-  RtRgbArg(int slot, Color16 def) : slot_(slot), pixel_(def, false, 32768) {
-    char def_str[48];
-    // Build default string using Color16 values (same format as RgbArgBase::init)
-    itoa((int)def.r, def_str, 10);
-    strcat(def_str, ",");
-    itoa((int)def.g, def_str + strlen(def_str), 10);
-    strcat(def_str, ",");
-    itoa((int)def.b, def_str + strlen(def_str), 10);
-    const char* arg = CurrentArgParser->GetArg(slot_, "COLOR", def_str);
-    if (arg) {
-      char* tmp;
-      int r = strtol(arg, &tmp, 0);
-      int g = (tmp && *tmp) ? strtol(tmp + 1, &tmp, 0) : 0;
-      int b = (tmp && *tmp) ? strtol(tmp + 1, nullptr, 0) : 0;
-      pixel_ = RGBA_um(Color16(r, g, b), false, 32768);
-    }
+  RtRgbArg(int slot, Color16 def) {
+    color_ = def;   // set protected RgbArgBase::color_ before init()
+    init(slot);     // reuse RgbArgBase arg-parsing (same format as compile-time RgbArg<>)
   }
-  void run(BladeBase*) override {}
-  RGBA_um getColor(int) override { return pixel_; }
-private:
-  int slot_;
-  RGBA_um pixel_;
+  void run(BladeBase* blade) override { RgbArgBase::run(blade); }
+  RGBA_um getColor(int) override { return RGBA_um(color_, false, 32768); }
 };
 
 // ---------------------------------------------------------------------------
@@ -231,86 +260,101 @@ private:
 };
 
 // InOutFuncX<OUT_MILLIS, IN_MILLIS>: extension timer 0..32768
-class RtInOutFunc : public RtFuncNode {
+// InOutFuncX<OUT_MS, IN_MS>: wraps InOutFuncSVFBase to reuse its animation math exactly.
+class RtInOutFunc : public RtFuncNode, public InOutFuncSVFBase {
 public:
-  RtInOutFunc(RtFuncNode* out_ms, RtFuncNode* in_ms)
-    : out_ms_(out_ms), in_ms_(in_ms) {}
+  RtInOutFunc(RtFuncNode* out_ms, RtFuncNode* in_ms) : out_ms_(out_ms), in_ms_(in_ms) {}
   ~RtInOutFunc() override { delete out_ms_; delete in_ms_; }
   void run(BladeBase* blade) override {
     out_ms_->run(blade);
     in_ms_->run(blade);
-    uint32_t now = micros();
-    uint32_t delta = now - last_micros_;
-    last_micros_ = now;
-    int out_ms = out_ms_->getInteger(0);
-    int in_ms  = in_ms_->getInteger(0);
-    if (blade->is_on()) {
-      extension_ = (extension_ < 0.00001f)
-                     ? 0.00001f
-                     : std::min(extension_ + delta / (out_ms * 1000.0f), 1.0f);
-    } else {
-      extension_ = std::max(extension_ - delta / (in_ms * 1000.0f), 0.0f);
-    }
-    ret_ = (int)(extension_ * 32768.0f);
+    InOutFuncSVFBase::run(blade, out_ms_->getInteger(0), in_ms_->getInteger(0));
   }
-  int getInteger(int) override { return ret_; }
-  float get_extension() const { return extension_; }
+  int getInteger(int led) override { return InOutFuncSVFBase::getInteger(led); }
 private:
   RtFuncNode* out_ms_;
   RtFuncNode* in_ms_;
-  float extension_ = 0.0f;
-  uint32_t last_micros_ = 0;
-  int ret_ = 0;
 };
 
-// InOutHelperF<EXTENSION>: per-LED wipe alpha (32768 when off, 0 when on)
-// Used inside AlphaL<Black, InOutHelperF<...>> to mask the blade during ignition.
-class RtInOutHelperF : public RtFuncNode {
+// InOutHelperF<EXTENSION>: wraps InOutHelperFBase to reuse its per-LED wipe math exactly.
+class RtInOutHelperF : public RtFuncNode, public InOutHelperFBase {
 public:
-  explicit RtInOutHelperF(RtFuncNode* ext, bool allow_disable = true)
-    : ext_(ext), allow_disable_(allow_disable) {}
+  explicit RtInOutHelperF(RtFuncNode* ext, bool /*allow_disable*/ = true) : ext_(ext) {}
   ~RtInOutHelperF() override { delete ext_; }
   void run(BladeBase* blade) override {
     ext_->run(blade);
-    int ext_val = ext_->getInteger(0);
-    // thres = ext_val * num_leds - 32768  (same as compiled InOutHelperF::run)
-    thres_ = (int32_t)ext_val * blade->num_leds() - 32768;
-    done_off_ = allow_disable_ && (ext_val == 0) && !blade->is_on();
+    thres = ext_->getInteger(0) * blade->num_leds() - 32768;
   }
-  int getInteger(int led) override {
-    int32_t x = (int32_t)led * 32768 - thres_;
-    return rt_clamp((int)x, 0, 32768);
-  }
-  bool done_off() const { return done_off_; }
+  int getInteger(int led) override { return InOutHelperFBase::getInteger(led); }
 private:
   RtFuncNode* ext_;
-  bool allow_disable_;
-  int32_t thres_ = 0;
-  bool done_off_ = false;
 };
 
-// Ifon<A, B>: return A when blade is on, B when off
-class RtIfon : public RtFuncNode {
+// InOutSparkTipX<BASE, EXTENSION, SPARK_COLOR, OFF_COLOR>:
+// Like InOutHelper but paints SPARK_COLOR at the wipe tip during extension.
+// Inherits InOutSparkTipX<RtColorAdapter, RtFuncAdapter, RtColorAdapter, RtColorAdapter> to
+// reuse Base::run() which computes on_ and thres (both now protected).
+// getColor() is overridden with RGBA_um math since MixColors() in the base uses compile-time types.
+class RtInOutSparkTipX : public RtColorNode,
+    public InOutSparkTipX<RtColorAdapter, RtFuncAdapter, RtColorAdapter, RtColorAdapter, false> {
+  using Base = InOutSparkTipX<RtColorAdapter, RtFuncAdapter, RtColorAdapter, RtColorAdapter, false>;
 public:
-  RtIfon(RtFuncNode* on_val, RtFuncNode* off_val)
-    : on_(on_val), off_(off_val) {}
-  ~RtIfon() override { delete on_; delete off_; }
+  RtInOutSparkTipX(RtColorNode* base_node, RtFuncNode* ext,
+                   RtColorNode* spark, RtColorNode* off) {
+    base_.node_       = base_node;
+    extension_.f_.node_ = ext;
+    spark_color_.node_  = spark;
+    off_color_.node_    = off;
+  }
+  ~RtInOutSparkTipX() override {
+    delete base_.node_; delete extension_.f_.node_;
+    delete spark_color_.node_; delete off_color_.node_;
+  }
   void run(BladeBase* blade) override {
-    on_->run(blade);
-    off_->run(blade);
-    is_on_ = blade->is_on();
+    spark_color_.run(blade);  // not run by Base::run(); run here so spark can have state
+    Base::run(blade);          // updates on_, thres, runs base_/extension_/off_color_
   }
-  int getInteger(int led) override {
-    return is_on_ ? on_->getInteger(led) : off_->getInteger(led);
+  RGBA_um getColor(int led) override {
+    RGBA_um ret = base_.node_->getColor(led);
+    if (on_) {
+      // Blend spark color near the wipe tip (4 LEDs ahead of the front)
+      int sm = rt_clamp(thres - 1024 - led * 256, 0, 255);
+      if (sm < 255) {
+        RGBA_um s = spark_color_.node_->getColor(led);
+        uint16_t smx = (uint16_t)(sm * 128);
+        ret = RGBA_um((s.c * (uint16_t)(32768 - smx) + ret.c * smx) >> 15,
+                      smx >= 16384 ? ret.overdrive : s.overdrive,
+                      (uint16_t)(((uint32_t)s.alpha * (32768 - smx) + (uint32_t)ret.alpha * smx) >> 15));
+      }
+    }
+    // Wipe: blend off_color below the threshold
+    int bm = rt_clamp(thres - led * 256, 0, 255);
+    if (bm < 255) {
+      RGBA_um o = off_color_.node_->getColor(led);
+      uint16_t bmx = (uint16_t)(bm * 128);
+      return RGBA_um((o.c * (uint16_t)(32768 - bmx) + ret.c * bmx) >> 15,
+                     bmx >= 16384 ? ret.overdrive : o.overdrive,
+                     (uint16_t)(((uint32_t)o.alpha * (32768 - bmx) + (uint32_t)ret.alpha * bmx) >> 15));
+    }
+    return ret;
   }
-private:
-  RtFuncNode* on_;
-  RtFuncNode* off_;
-  bool is_on_ = false;
+};
+
+// Ifon<A, B>: reuses Ifon<RtFuncAdapter, RtFuncAdapter> — same blade.is_on() logic.
+class RtIfon : public RtFuncNode, public Ifon<RtFuncAdapter, RtFuncAdapter> {
+public:
+  RtIfon(RtFuncNode* on_val, RtFuncNode* off_val) {
+    ifon_.node_ = on_val;
+    ifoff_.node_ = off_val;
+  }
+  ~RtIfon() override { delete ifon_.node_; delete ifoff_.node_; }
+  void run(BladeBase* blade) override { Ifon<RtFuncAdapter, RtFuncAdapter>::run(blade); }
+  int getInteger(int led) override { return Ifon<RtFuncAdapter, RtFuncAdapter>::getInteger(led); }
 };
 
 // SmoothStep<POS, WIDTH>: smooth sigmoid by blade position
-class RtSmoothStep : public RtFuncNode {
+// SmoothStep<POS, WIDTH>: wraps SmoothStepBase to reuse its per-LED sigmoid math.
+class RtSmoothStep : public RtFuncNode, public SmoothStepBase {
 public:
   RtSmoothStep(RtFuncNode* pos, RtFuncNode* width) : pos_(pos), width_(width) {}
   ~RtSmoothStep() override { delete pos_; delete width_; }
@@ -326,16 +370,10 @@ public:
       location_ = 32768 * pos_->getInteger(0) / w - 16384;
     }
   }
-  int getInteger(int led) override {
-    int x = led * mult_ - location_;
-    if (x < 0) return 0;
-    if (x > 32768) return 32768;
-    return (((x * x) >> 14) * ((3 << 14) - x)) >> 15;
-  }
+  int getInteger(int led) override { return SmoothStepBase::getInteger(led); }
 private:
   RtFuncNode* pos_;
   RtFuncNode* width_;
-  int mult_ = 0, location_ = 0;
 };
 
 // Scale<F, A, B>: map F in 0..32768 to range A..B
@@ -356,8 +394,8 @@ private:
   int add_ = 0, mul_ = 0;
 };
 
-// Bump<POS, WIDTH>: gaussian bump shape
-class RtBump : public RtFuncNode {
+// Bump<POS, WIDTH>: wraps BumpBase to reuse its gaussian shape math and bump_shape table.
+class RtBump : public RtFuncNode, public BumpBase {
 public:
   RtBump(RtFuncNode* pos, RtFuncNode* width) : pos_(pos), width_(width) {}
   ~RtBump() override { delete pos_; delete width_; }
@@ -370,23 +408,10 @@ public:
     mult_     = (int)m;
     location_ = (int)((int64_t)pos_->getInteger(0) * blade->num_leds() * mult_ / 32768);
   }
-  int getInteger(int led) override {
-    static const uint8_t shape[33] = {
-      255,255,252,247,240,232,222,211,
-      199,186,173,159,145,132,119,106,
-       94, 82, 72, 62, 53, 45, 38, 32,
-       26, 22, 18, 14, 11,  9,  7,  5, 0
-    };
-    uint32_t dist = (uint32_t)std::abs(led * mult_ - location_);
-    uint32_t p = dist >> 7;
-    if (p >= 32) return 0;
-    int m = dist & 0x3f;
-    return shape[p] * (128 - m) + shape[p + 1] * m;
-  }
+  int getInteger(int led) override { return BumpBase::getInteger(led); }
 private:
   RtFuncNode* pos_;
   RtFuncNode* width_;
-  int mult_ = 1, location_ = -10000;
 };
 
 // BladeAngle<MIN, MAX>: 0..32768 based on physical blade angle
@@ -809,52 +834,54 @@ public:
 private: RtFuncNode* period_ms_; int duty_pct_; int v_ = 0;
 };
 
-// IsLessThan<A,B>: 0 or 32768
-class RtIsLessThan : public RtFuncNode {
+// IsLessThan<A,B>: wraps IsLessThanBase<RtFuncAdapter, RtFuncAdapter> — reuses upstream comparison logic.
+class RtIsLessThan : public RtFuncNode, public IsLessThanBase<RtFuncAdapter, RtFuncAdapter> {
+  using Base = IsLessThanBase<RtFuncAdapter, RtFuncAdapter>;
 public:
-  RtIsLessThan(RtFuncNode* a, RtFuncNode* b) : a_(a), b_(b) {}
-  ~RtIsLessThan() override { delete a_; delete b_; }
-  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); v_ = a_->getInteger(0) < b_->getInteger(0) ? 32768 : 0; }
-  int getInteger(int) override { return v_; }
-private: RtFuncNode* a_; RtFuncNode* b_; int v_ = 0;
-};
-class RtIsGreaterThan : public RtFuncNode {
-public:
-  RtIsGreaterThan(RtFuncNode* a, RtFuncNode* b) : a_(a), b_(b) {}
-  ~RtIsGreaterThan() override { delete a_; delete b_; }
-  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); v_ = a_->getInteger(0) > b_->getInteger(0) ? 32768 : 0; }
-  int getInteger(int) override { return v_; }
-private: RtFuncNode* a_; RtFuncNode* b_; int v_ = 0;
+  RtIsLessThan(RtFuncNode* a, RtFuncNode* b) { f_.node_ = a; v_.node_ = b; }
+  ~RtIsLessThan() override { delete f_.node_; delete v_.node_; }
+  void run(BladeBase* blade) override { Base::run(blade); }
+  int getInteger(int led) override { return Base::getInteger(led); }
 };
 
-// Sum<A,B>
-class RtSum : public RtFuncNode {
+// IsGreaterThan<A,B> = IsLessThan<B,A>: swaps the adapter nodes so Base checks b < a.
+class RtIsGreaterThan : public RtFuncNode, public IsLessThanBase<RtFuncAdapter, RtFuncAdapter> {
+  using Base = IsLessThanBase<RtFuncAdapter, RtFuncAdapter>;
 public:
-  RtSum(RtFuncNode* a, RtFuncNode* b) : a_(a), b_(b) {}
-  ~RtSum() override { delete a_; delete b_; }
-  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); }
-  int getInteger(int led) override { return a_->getInteger(led) + b_->getInteger(led); }
-private: RtFuncNode* a_; RtFuncNode* b_;
+  RtIsGreaterThan(RtFuncNode* a, RtFuncNode* b) { f_.node_ = b; v_.node_ = a; }
+  ~RtIsGreaterThan() override { delete f_.node_; delete v_.node_; }
+  void run(BladeBase* blade) override { Base::run(blade); }
+  int getInteger(int led) override { return Base::getInteger(led); }
 };
 
-// Mult<A,B>: (a*b) >> 15
-class RtMult : public RtFuncNode {
+// Sum<A,B>: wraps SumBase<RtFuncAdapter, RtFuncAdapter> — reuses upstream add logic.
+class RtSum : public RtFuncNode, public SumBase<RtFuncAdapter, RtFuncAdapter> {
+  using Base = SumBase<RtFuncAdapter, RtFuncAdapter>;
 public:
-  RtMult(RtFuncNode* a, RtFuncNode* b) : a_(a), b_(b) {}
-  ~RtMult() override { delete a_; delete b_; }
-  void run(BladeBase* blade) override { a_->run(blade); b_->run(blade); }
-  int getInteger(int led) override { return ((int64_t)a_->getInteger(led) * b_->getInteger(led)) >> 15; }
-private: RtFuncNode* a_; RtFuncNode* b_;
+  RtSum(RtFuncNode* a, RtFuncNode* b) { a_.node_ = a; b_.node_ = b; }
+  ~RtSum() override { delete a_.node_; delete b_.node_; }
+  void run(BladeBase* blade) override { Base::run(blade); }
+  int getInteger(int led) override { return Base::getInteger(led); }
 };
 
-// ModF<F,N>: f % n
-class RtModF : public RtFuncNode {
+// Mult<A,B>: wraps MultBase<RtFuncAdapter, RtFuncAdapter> — reuses upstream multiply logic.
+class RtMult : public RtFuncNode, public MultBase<RtFuncAdapter, RtFuncAdapter> {
+  using Base = MultBase<RtFuncAdapter, RtFuncAdapter>;
 public:
-  RtModF(RtFuncNode* f, RtFuncNode* n) : f_(f), n_(n) {}
-  ~RtModF() override { delete f_; delete n_; }
-  void run(BladeBase* blade) override { f_->run(blade); n_->run(blade); }
-  int getInteger(int led) override { int n = n_->getInteger(0); return n ? f_->getInteger(led) % n : 0; }
-private: RtFuncNode* f_; RtFuncNode* n_;
+  RtMult(RtFuncNode* a, RtFuncNode* b) { f_.node_ = a; v_.node_ = b; }
+  ~RtMult() override { delete f_.node_; delete v_.node_; }
+  void run(BladeBase* blade) override { Base::run(blade); }
+  int getInteger(int led) override { return Base::getInteger(led); }
+};
+
+// ModF<F,N>: wraps ModBase<RtFuncAdapter, RtFuncAdapter> — reuses upstream MOD logic.
+class RtModF : public RtFuncNode, public ModBase<RtFuncAdapter, RtFuncAdapter> {
+  using Base = ModBase<RtFuncAdapter, RtFuncAdapter>;
+public:
+  RtModF(RtFuncNode* f, RtFuncNode* n) { f_.node_ = f; max_.node_ = n; }
+  ~RtModF() override { delete f_.node_; delete max_.node_; }
+  void run(BladeBase* blade) override { Base::run(blade); }
+  int getInteger(int led) override { return Base::getInteger(led); }
 };
 
 // HoldPeakF<F, HOLD_MS, SPEED>
@@ -882,35 +909,44 @@ private:
   int v_ = 0; uint32_t last_ = 0; uint32_t last_peak_ = 0;
 };
 
-// Trigger<EFFECT, SMOOTH_UP_MS, SMOOTH_DOWN_MS, ZERO_VALUE>
-class RtTrigger : public RtFuncNode {
+// Trigger<EFFECT, FADE_IN_MILLIS, SUSTAIN_MILLIS, FADE_OUT_MILLIS [,DELAY_MILLIS]>
+// Wraps TriggerBase to reuse its delay/attack/sustain/release state machine exactly.
+class RtTrigger : public RtFuncNode, public TriggerBase {
 public:
-  RtTrigger(EffectType e, RtFuncNode* up, RtFuncNode* down, RtFuncNode* zero)
-    : effect_(e), up_(up), down_(down), zero_(zero) {}
-  ~RtTrigger() override { delete up_; delete down_; delete zero_; }
-  void run(BladeBase* b) override {
-    up_->run(b); down_->run(b); zero_->run(b);
+  RtTrigger(EffectType e, RtFuncNode* fade_in, RtFuncNode* sustain,
+            RtFuncNode* fade_out, RtFuncNode* delay = nullptr)
+    : effect_(e), fade_in_(fade_in), sustain_(sustain),
+      fade_out_(fade_out), delay_(delay) {}
+  ~RtTrigger() override { delete fade_in_; delete sustain_; delete fade_out_; delete delay_; }
+  void run(BladeBase* blade) override {
+    fade_in_->run(blade); sustain_->run(blade); fade_out_->run(blade);
+    if (delay_) delay_->run(blade);
     BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
     for (size_t i = 0; i < n; i++) {
-      if (effects[i].type == effect_ && effects[i].start_micros != last_) {
-        last_ = effects[i].start_micros; fired_ms_ = millis();
+      if (effects[i].type == effect_ && effects[i].start_micros != last_event_micros_) {
+        last_event_micros_ = effects[i].start_micros;
+        start_time_ = micros();
+        trigger_state_ = TRIGGER_DELAY;
+        break;
       }
     }
-    uint32_t elapsed = millis() - fired_ms_;
-    int up_ms = up_->getInteger(0), dn_ms = down_->getInteger(0);
-    if (elapsed < (uint32_t)up_ms) {
-      v_ = elapsed * 32768 / (up_ms > 0 ? up_ms : 1);
-    } else if (elapsed < (uint32_t)(up_ms + dn_ms)) {
-      v_ = (up_ms + dn_ms - elapsed) * 32768 / (dn_ms > 0 ? dn_ms : 1);
-    } else {
-      v_ = zero_->getInteger(0);
-    }
-    v_ = rt_clamp(v_, 0, 32768);
+    TriggerBase::run(blade);
   }
-  int getInteger(int) override { return v_; }
+  uint32_t get_millis_for_state(BladeBase*) override {
+    switch (trigger_state_) {
+    case TRIGGER_DELAY:   return delay_ ? (uint32_t)delay_->getInteger(0) : 0;
+    case TRIGGER_ATTACK:  return (uint32_t)fade_in_->getInteger(0);
+    case TRIGGER_SUSTAIN: return (uint32_t)sustain_->getInteger(0);
+    case TRIGGER_RELEASE: return (uint32_t)fade_out_->getInteger(0);
+    case TRIGGER_OFF: break;
+    }
+    return 1000000;
+  }
+  int getInteger(int) override { return TriggerBase::getInteger(0); }
 private:
-  EffectType effect_; RtFuncNode* up_; RtFuncNode* down_; RtFuncNode* zero_;
-  uint32_t last_ = 0; uint32_t fired_ms_ = 0; int v_ = 0;
+  EffectType effect_;
+  RtFuncNode* fade_in_; RtFuncNode* sustain_; RtFuncNode* fade_out_; RtFuncNode* delay_;
+  uint32_t last_event_micros_ = 0;
 };
 
 // IgnitionTime<DEFAULT> / RetractionTime<DEFAULT>: sound length
@@ -943,6 +979,354 @@ public:
   }
   int getInteger(int) override { return v_; }
 private: int def_, v_;
+};
+
+// ---------------------------------------------------------------------------
+// Additional function nodes
+// ---------------------------------------------------------------------------
+
+// Subtract<A, B>: wraps SubtractBase<RtFuncAdapter, RtFuncAdapter> — reuses upstream subtract logic.
+class RtSubtract : public RtFuncNode, public SubtractBase<RtFuncAdapter, RtFuncAdapter> {
+  using Base = SubtractBase<RtFuncAdapter, RtFuncAdapter>;
+public:
+  RtSubtract(RtFuncNode* a, RtFuncNode* b) { a_.node_ = a; b_.node_ = b; }
+  ~RtSubtract() override { delete a_.node_; delete b_.node_; }
+  void run(BladeBase* blade) override { Base::run(blade); }
+  int getInteger(int led) override { return Base::getInteger(led); }
+};
+
+// AbsF<F>: absolute value
+class RtAbsF : public RtFuncNode {
+public:
+  explicit RtAbsF(RtFuncNode* f) : f_(f) {}
+  ~RtAbsF() override { delete f_; }
+  void run(BladeBase* blade) override { f_->run(blade); }
+  int getInteger(int led) override { return abs(f_->getInteger(led)); }
+private: RtFuncNode* f_;
+};
+
+// ClampF<F, MIN, MAX>: clamp value between MIN and MAX
+class RtClampF : public RtFuncNode {
+public:
+  RtClampF(RtFuncNode* f, RtFuncNode* mn, RtFuncNode* mx) : f_(f), mn_(mn), mx_(mx) {}
+  ~RtClampF() override { delete f_; delete mn_; delete mx_; }
+  void run(BladeBase* blade) override { f_->run(blade); mn_->run(blade); mx_->run(blade); }
+  int getInteger(int led) override {
+    return rt_clamp(f_->getInteger(led), mn_->getInteger(led), mx_->getInteger(led));
+  }
+private: RtFuncNode* f_; RtFuncNode* mn_; RtFuncNode* mx_;
+};
+
+// Divide<F, V>: F / V (0 if V==0)
+class RtDivide : public RtFuncNode {
+public:
+  RtDivide(RtFuncNode* f, RtFuncNode* v) : f_(f), v_(v) {}
+  ~RtDivide() override { delete f_; delete v_; }
+  void run(BladeBase* blade) override { f_->run(blade); v_->run(blade); }
+  int getInteger(int led) override {
+    int v = v_->getInteger(led);
+    return v ? f_->getInteger(led) / v : 0;
+  }
+private: RtFuncNode* f_; RtFuncNode* v_;
+};
+
+// IsBetween<F, MIN, MAX>: 32768 if MIN < F < MAX, else 0
+class RtIsBetween : public RtFuncNode {
+public:
+  RtIsBetween(RtFuncNode* f, RtFuncNode* mn, RtFuncNode* mx) : f_(f), mn_(mn), mx_(mx) {}
+  ~RtIsBetween() override { delete f_; delete mn_; delete mx_; }
+  void run(BladeBase* blade) override { f_->run(blade); mn_->run(blade); mx_->run(blade); }
+  int getInteger(int led) override {
+    int f = f_->getInteger(led);
+    return (f > mn_->getInteger(led) && f < mx_->getInteger(led)) ? 32768 : 0;
+  }
+private: RtFuncNode* f_; RtFuncNode* mn_; RtFuncNode* mx_;
+};
+
+// TimeSinceEffect<EFFECT>: milliseconds since the effect last fired
+class RtTimeSinceEffect : public RtFuncNode {
+public:
+  explicit RtTimeSinceEffect(EffectType effect) : effect_(effect) {}
+  void run(BladeBase*) override {
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if ((effect_ == EFFECT_NONE || effects[i].type == effect_) &&
+          effects[i].start_micros != last_us_) {
+        last_us_ = effects[i].start_micros; break;
+      }
+    }
+    uint32_t now = micros();
+    uint32_t ret = now - last_us_;
+    if (ret > 1000000000u) { last_us_ = now - 1000000000u; ret = 1000000000u; }
+    v_ = (int)(ret / 1000);
+  }
+  int getInteger(int) override { return v_; }
+private: EffectType effect_; uint32_t last_us_ = 0; int v_ = 0;
+};
+
+// VolumeLevel: 0-32768 based on current volume setting
+class RtVolumeLevel : public RtFuncNode {
+public:
+  void run(BladeBase*) override {
+#if defined(ENABLE_AUDIO) && defined(VOLUME)
+    v_ = rt_clamp(dynamic_mixer.get_volume() * 32768 / VOLUME, 0, 32768);
+#else
+    v_ = 0;
+#endif
+  }
+  int getInteger(int) override { return v_; }
+private: int v_ = 0;
+};
+
+// WavNum<EFFECT>: which sound file was played (0 = first)
+class RtWavNum : public RtFuncNode {
+public:
+  explicit RtWavNum(EffectType effect) : effect_(effect) {}
+  void run(BladeBase*) override {
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if (effect_ == EFFECT_NONE || effects[i].type == effect_) {
+        v_ = effects[i].wavnum; break;
+      }
+    }
+  }
+  int getInteger(int) override { return v_; }
+private: EffectType effect_; int v_ = 0;
+};
+
+// ChangeSlowly<F, SPEED>: lag filter — limits rate of change to SPEED units/second
+class RtChangeSlowly : public RtFuncNode {
+public:
+  RtChangeSlowly(RtFuncNode* f, RtFuncNode* speed) : f_(f), speed_(speed) {}
+  ~RtChangeSlowly() override { delete f_; delete speed_; }
+  void run(BladeBase* blade) override {
+    f_->run(blade); speed_->run(blade);
+    uint32_t now = micros();
+    uint64_t delta = now - last_; last_ = now;
+    if (delta > 1000000) delta = 1;
+    uint64_t step = delta * (uint64_t)speed_->getInteger(0) / 1000000;
+    int target = f_->getInteger(0);
+    if (step >= (uint64_t)abs(value_ - target)) {
+      value_ = target;
+    } else if (value_ < target) {
+      value_ += (int)step;
+    } else {
+      value_ -= (int)step;
+    }
+  }
+  int getInteger(int) override { return value_; }
+private: RtFuncNode* f_; RtFuncNode* speed_; int value_ = 0; uint32_t last_ = 0;
+};
+
+// CenterDistF<CENTER>: |led/num_leds - CENTER/32768| * 32768
+class RtCenterDistF : public RtFuncNode {
+public:
+  explicit RtCenterDistF(RtFuncNode* center) : center_(center) {}
+  ~RtCenterDistF() override { delete center_; }
+  void run(BladeBase* blade) override { center_->run(blade); n_ = blade->num_leds(); }
+  int getInteger(int led) override {
+    return abs(led * 32768 / n_ - center_->getInteger(led));
+  }
+private: RtFuncNode* center_; int n_ = 1;
+};
+
+// LinearSectionF<POSITION, FRACTION>: fraction of LED overlap with the section
+class RtLinearSectionF : public RtFuncNode {
+public:
+  RtLinearSectionF(RtFuncNode* pos, RtFuncNode* frac) : pos_(pos), frac_(frac) {}
+  ~RtLinearSectionF() override { delete pos_; delete frac_; }
+  void run(BladeBase* blade) override {
+    pos_->run(blade); frac_->run(blade);
+    int n = blade->num_leds();
+    int pos = pos_->getInteger(0), frac = frac_->getInteger(0);
+    start_ = rt_clamp((pos - frac / 2) * n, 0, 32768 * n);
+    end_   = rt_clamp((pos + frac / 2) * n, 0, 32768 * n);
+  }
+  int getInteger(int led) override {
+    int ls = led * 32768, le = ls + 32768;
+    int s = start_ > ls ? start_ : ls;
+    int e = end_   < le ? end_   : le;
+    return s < e ? e - s : 0;
+  }
+private: RtFuncNode* pos_; RtFuncNode* frac_; int start_ = 0, end_ = 0;
+};
+
+// CircularSectionF<POSITION, FRACTION>: linear section with wrap-around
+class RtCircularSectionF : public RtFuncNode {
+public:
+  RtCircularSectionF(RtFuncNode* pos, RtFuncNode* frac) : pos_(pos), frac_(frac) {}
+  ~RtCircularSectionF() override { delete pos_; delete frac_; }
+  void run(BladeBase* blade) override {
+    pos_->run(blade); frac_->run(blade);
+    n_ = blade->num_leds();
+    int frac = frac_->getInteger(0);
+    if (frac >= 32768) { start_ = 0; end_ = (uint32_t)n_ * 32768; return; }
+    if (frac == 0)     { start_ = end_ = 0; return; }
+    int pos = pos_->getInteger(0);
+    start_ = (uint32_t)(((pos + 32768 - frac / 2) & 0x7fff)) * n_;
+    end_   = (uint32_t)(((pos + frac / 2) & 0x7fff)) * n_;
+  }
+  int getInteger(int led) override {
+    uint32_t ls = (uint32_t)led * 32768, le = ls + 32768;
+    uint32_t nm = (uint32_t)n_ * 32768;
+    if (start_ <= end_) {
+      uint32_t s = start_ > ls ? start_ : ls;
+      uint32_t e = end_   < le ? end_   : le;
+      return (int)(s < e ? e - s : 0);
+    } else {
+      uint32_t r1s = ls, r1e = le < end_   ? le : end_;
+      uint32_t r2s = start_ > ls ? start_ : ls, r2e = le < nm ? le : nm;
+      return (int)(r1s < r1e ? r1e - r1s : 0) + (int)(r2s < r2e ? r2e - r2s : 0);
+    }
+  }
+private: RtFuncNode* pos_; RtFuncNode* frac_; int n_ = 1; uint32_t start_ = 0, end_ = 0;
+};
+
+// IncrementModuloF<PULSE, MAX, INCREMENT>: counter wraps at MAX on each pulse
+class RtIncrementModuloF : public RtFuncNode {
+public:
+  RtIncrementModuloF(RtFuncNode* pulse, RtFuncNode* max, RtFuncNode* incr)
+    : pulse_(pulse), max_(max), incr_(incr) {}
+  ~RtIncrementModuloF() override { delete pulse_; delete max_; delete incr_; }
+  void run(BladeBase* blade) override {
+    pulse_->run(blade); max_->run(blade); incr_->run(blade);
+    if (pulse_->getInteger(0)) {
+      int mx = max_->getInteger(0);
+      if (mx > 0) value_ = (value_ + incr_->getInteger(0)) % mx;
+    }
+  }
+  int getInteger(int) override { return value_; }
+private: RtFuncNode* pulse_; RtFuncNode* max_; RtFuncNode* incr_; int value_ = 0;
+};
+
+// IncrementWithResetF<PULSE, RESET, MAX, I>: counter that can be reset
+class RtIncrementWithResetF : public RtFuncNode {
+public:
+  RtIncrementWithResetF(RtFuncNode* pulse, RtFuncNode* reset, RtFuncNode* max, RtFuncNode* incr)
+    : pulse_(pulse), reset_(reset), max_(max), incr_(incr) {}
+  ~RtIncrementWithResetF() override { delete pulse_; delete reset_; delete max_; delete incr_; }
+  void run(BladeBase* blade) override {
+    pulse_->run(blade); reset_->run(blade); max_->run(blade); incr_->run(blade);
+    if (reset_->getInteger(0)) value_ = 0;
+    if (pulse_->getInteger(0)) {
+      int mx = max_->getInteger(0);
+      value_ = std::min(value_ + incr_->getInteger(0), mx);
+    }
+  }
+  int getInteger(int) override { return value_; }
+private: RtFuncNode* pulse_; RtFuncNode* reset_; RtFuncNode* max_; RtFuncNode* incr_; int value_ = 0;
+};
+
+// ThresholdPulseF<F, THRESHOLD, HYST_PCT>: fires 32768 once when F crosses threshold upward
+class RtThresholdPulseF : public RtFuncNode {
+public:
+  RtThresholdPulseF(RtFuncNode* f, RtFuncNode* thr, int hyst_pct = 66)
+    : f_(f), thr_(thr), hyst_pct_(hyst_pct) {}
+  ~RtThresholdPulseF() override { delete f_; delete thr_; }
+  void run(BladeBase* blade) override {
+    f_->run(blade); thr_->run(blade);
+    int f = f_->getInteger(0), t = thr_->getInteger(0);
+    if (triggered_) {
+      if (f < t * hyst_pct_ / 100) triggered_ = false;
+      v_ = 0;
+    } else {
+      v_ = (f >= t) ? (triggered_ = true, 32768) : 0;
+    }
+  }
+  int getInteger(int) override { return v_; }
+private: RtFuncNode* f_; RtFuncNode* thr_; int hyst_pct_; bool triggered_ = false; int v_ = 0;
+};
+
+// RandomBlinkF<MILLIHZ>: per-LED random on/off toggled at MILLIHZ rate
+class RtRandomBlinkF : public RtFuncNode {
+public:
+  explicit RtRandomBlinkF(RtFuncNode* millihz) : millihz_(millihz) {}
+  ~RtRandomBlinkF() override { delete millihz_; }
+  void run(BladeBase* blade) override {
+    millihz_->run(blade);
+    int mhz = millihz_->getInteger(0);
+    if (mhz <= 0) mhz = 1;
+    uint32_t now = micros();
+    int n = blade->num_leds();
+    if ((int)vals_.size() != n) vals_.resize(n, 0);
+    if (now - last_ > 1000000000u / (uint32_t)mhz) {
+      last_ = now;
+      for (auto& v : vals_) v = (random(2) ? 32768 : 0);
+    }
+  }
+  int getInteger(int led) override {
+    return (led < (int)vals_.size()) ? vals_[led] : 0;
+  }
+private: RtFuncNode* millihz_; RtVec<int> vals_; uint32_t last_ = 0;
+};
+
+// SparkleF<CHANCE_PROMILLE, INTENSITY>: wraps SparkleBase for sparkle simulation.
+class RtSparkleF : public RtFuncNode, public SparkleBase {
+public:
+  RtSparkleF(int chance, int intensity) : chance_(chance), intensity_(intensity) {}
+  void run(BladeBase* blade) override { SparkleBase::run(blade, chance_, intensity_); }
+  int getInteger(int led) override { return SparkleBase::getInteger(led); }
+private: int chance_; int intensity_;
+};
+
+// OnSparkF<MILLIS>: 32768→0 fade over MILLIS after blade-on
+class RtOnSparkF : public RtFuncNode {
+public:
+  explicit RtOnSparkF(RtFuncNode* ms) : ms_(ms) {}
+  ~RtOnSparkF() override { delete ms_; }
+  void run(BladeBase* blade) override {
+    ms_->run(blade);
+    bool on = blade->is_on();
+    if (on != on_) { on_ = on; if (on) on_millis_ = millis(); }
+  }
+  int getInteger(int) override {
+    if (!on_) return 0;
+    int fade = ms_->getInteger(0);
+    if (fade <= 0) return 0;
+    int t = (int)(millis() - on_millis_);
+    if (t >= fade) return 0;
+    return 32768 - 32768 * t / fade;
+  }
+private: RtFuncNode* ms_; bool on_ = false; uint32_t on_millis_ = 0;
+};
+
+// BlastFadeoutF<FADE_MS, EFFECT>: uniform fade to zero over FADE_MS after blast
+class RtBlastFadeoutF : public RtFuncNode {
+public:
+  RtBlastFadeoutF(int fade_ms, EffectType effect) : fade_ms_(fade_ms), effect_(effect) {}
+  void run(BladeBase* b) override { num_blasts_ = SaberBase::GetEffects(&effects_); }
+  int getInteger(int) override {
+    int mix = 0;
+    for (size_t i = 0; i < num_blasts_; i++) {
+      if (effects_[i].type != effect_) continue;
+      uint32_t T = micros() - effects_[i].start_micros;
+      int M = 1000 - (int)(T / (uint32_t)fade_ms_);
+      if (M > 0) mix += 32768 * M / 1000;
+    }
+    return rt_clamp(mix, 0, 32768);
+  }
+private: int fade_ms_; EffectType effect_; size_t num_blasts_ = 0; BladeEffect* effects_ = nullptr;
+};
+
+// IntSelectX<F, N1, N2, ...>: pick from a list of functions by index F
+class RtIntSelectX : public RtFuncNode {
+public:
+  RtIntSelectX(RtFuncNode* sel, RtVec<RtFuncNode*> funcs)
+    : sel_(sel), funcs_(rt_move(funcs)) {}
+  ~RtIntSelectX() override { delete sel_; for (auto* f : funcs_) delete f; }
+  void run(BladeBase* blade) override {
+    sel_->run(blade);
+    for (auto* f : funcs_) f->run(blade);
+    if (!funcs_.empty()) {
+      int idx = sel_->getInteger(0) % (int)funcs_.size();
+      if (idx < 0) idx += (int)funcs_.size();
+      idx_ = idx;
+    }
+  }
+  int getInteger(int led) override {
+    return funcs_.empty() ? 0 : funcs_[idx_]->getInteger(led);
+  }
+private: RtFuncNode* sel_; RtVec<RtFuncNode*> funcs_; int idx_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -1275,6 +1659,232 @@ public:
 private: RtVec<RtColorNode*> colors_;
 };
 
+// ---------------------------------------------------------------------------
+// Additional color nodes
+// ---------------------------------------------------------------------------
+
+// Gradient<C1, C2, ...>: spatial gradient from base (C1) to tip (last)
+class RtGradient : public RtColorNode {
+public:
+  explicit RtGradient(RtVec<RtColorNode*> colors) : colors_(rt_move(colors)) {}
+  ~RtGradient() override { for (auto* c : colors_) delete c; }
+  void run(BladeBase* blade) override {
+    for (auto* c : colors_) c->run(blade);
+    nc_ = (int)colors_.size();
+    n_  = blade->num_leds();
+    mul_ = nc_ > 1 ? ((nc_ - 1) << 15) / (n_ > 1 ? n_ - 1 : 1) : 0;
+  }
+  RGBA_um getColor(int led) override {
+    if (nc_ == 0) return RGBA_um::Transparent();
+    if (nc_ == 1) return colors_[0]->getColor(led);
+    int x = led * mul_;
+    int idx = x >> 15;
+    if (idx >= nc_ - 1) return colors_[nc_ - 1]->getColor(led);
+    int mix = x & 0x7fff;
+    RGBA_um a = colors_[idx]->getColor(led);
+    RGBA_um b = colors_[idx + 1]->getColor(led);
+    uint16_t bm = (uint16_t)mix, am = (uint16_t)(32768 - mix);
+    return RGBA_um((a.c * am + b.c * bm) >> 15,
+                   mix >= 16384 ? b.overdrive : a.overdrive,
+                   (uint16_t)(((uint32_t)a.alpha * am + (uint32_t)b.alpha * bm) >> 15));
+  }
+private: RtVec<RtColorNode*> colors_; int nc_ = 0, n_ = 1, mul_ = 0;
+};
+
+// Rainbow: basic RGB rainbow matching ProffieOS Rainbow::getColor()
+class RtRainbow : public RtColorNode {
+public:
+  void run(BladeBase*) override { m_ = millis(); }
+  RGBA_um getColor(int led) override {
+    Color16 c(
+      (uint16_t)std::max(0, sin_table[((m_ * 3 + led * 50)) & 0x3ff] << 2),
+      (uint16_t)std::max(0, sin_table[((m_ * 3 + led * 50 + 341)) & 0x3ff] << 2),
+      (uint16_t)std::max(0, sin_table[((m_ * 3 + led * 50 + 682)) & 0x3ff] << 2));
+    return RGBA_um(c, false, 32768);
+  }
+private: uint32_t m_ = 0;
+};
+
+// ColorCycle<OFF_C,OFF_PCT,OFF_RPM,ON_C,ON_PCT,ON_RPM,FADE_MS,BASE_C>: wraps ColorCycleBase to
+// reuse its rotation/fade animation state machine (fade_, pos_, start_, end_, num_leds_).
+// getColor() uses ColorCycleBase::getMix() for the circular-range intersection.
+class RtColorCycle : public RtColorNode, public ColorCycleBase {
+public:
+  RtColorCycle(RtColorNode* off_c, int off_pct, int off_rpm,
+               RtColorNode* on_c, int on_pct, int on_rpm,
+               int fade_ms, RtColorNode* base_c)
+    : off_c_(off_c), on_c_(on_c), base_c_(base_c),
+      off_pct_(off_pct), off_rpm_(off_rpm),
+      on_pct_(on_pct), on_rpm_(on_rpm), fade_ms_(fade_ms > 0 ? fade_ms : 1) {}
+  ~RtColorCycle() override { delete off_c_; delete on_c_; delete base_c_; }
+  void run(BladeBase* blade) override {
+    off_c_->run(blade); on_c_->run(blade); base_c_->run(blade);
+    ColorCycleBase::run(blade, off_pct_, off_rpm_, on_pct_, on_rpm_, fade_ms_, false);
+  }
+  RGBA_um getColor(int led) override {
+    int mix = getMix(led); // 0..16384 (handles circular wrap via Range intersection)
+    RGBA_um oc = off_c_->getColor(led), nc = on_c_->getColor(led), bc = base_c_->getColor(led);
+    uint16_t fi = (uint16_t)fade_int_, fni = (uint16_t)(16384 - fade_int_);
+    RGBA_um cc((oc.c * fni + nc.c * fi) >> 14,
+               fade_int_ >= 8192 ? nc.overdrive : oc.overdrive,
+               (uint16_t)(((uint32_t)oc.alpha * fni + (uint32_t)nc.alpha * fi) >> 14));
+    uint16_t mi = (uint16_t)mix, mni = (uint16_t)(16384 - mix);
+    return RGBA_um((bc.c * mni + cc.c * mi) >> 14,
+                   mix >= 8192 ? cc.overdrive : bc.overdrive,
+                   (uint16_t)(((uint32_t)bc.alpha * mni + (uint32_t)cc.alpha * mi) >> 14));
+  }
+private:
+  RtColorNode* off_c_; RtColorNode* on_c_; RtColorNode* base_c_;
+  int off_pct_, off_rpm_, on_pct_, on_rpm_, fade_ms_;
+};
+
+// Cylon: wraps CylonBase to reuse its sinusoidal-bounce animation state machine.
+// getColor() uses CylonBase's protected start_, end_, fade_int_, num_leds_ via Range intersection.
+class RtCylon : public RtColorNode, public CylonBase {
+public:
+  RtCylon(RtColorNode* off_c, int off_pct, int off_rpm,
+          RtColorNode* on_c, int on_pct, int on_rpm,
+          int fade_ms, RtColorNode* base_c)
+    : off_c_(off_c), on_c_(on_c), base_c_(base_c),
+      off_pct_(off_pct), off_rpm_(off_rpm),
+      on_pct_(on_pct), on_rpm_(on_rpm), fade_ms_(fade_ms > 0 ? fade_ms : 1) {}
+  ~RtCylon() override { delete off_c_; delete on_c_; delete base_c_; }
+  void run(BladeBase* blade) override {
+    off_c_->run(blade); on_c_->run(blade); base_c_->run(blade);
+    CylonBase::run(blade, off_pct_, off_rpm_, on_pct_, on_rpm_, fade_ms_, false);
+  }
+  RGBA_um getColor(int led) override {
+    Range led_range((uint32_t)led * 16384, (uint32_t)led * 16384 + 16384);
+    int mix = (int)(Range(start_, end_) & led_range).size(); // 0..16384
+    RGBA_um oc = off_c_->getColor(led), nc = on_c_->getColor(led), bc = base_c_->getColor(led);
+    uint16_t fi = (uint16_t)fade_int_, fni = (uint16_t)(16384 - fade_int_);
+    RGBA_um cc((oc.c * fni + nc.c * fi) >> 14,
+               fade_int_ >= 8192 ? nc.overdrive : oc.overdrive,
+               (uint16_t)(((uint32_t)oc.alpha * fni + (uint32_t)nc.alpha * fi) >> 14));
+    uint16_t mi = (uint16_t)mix, mni = (uint16_t)(16384 - mix);
+    return RGBA_um((bc.c * mni + cc.c * mi) >> 14,
+                   mix >= 8192 ? cc.overdrive : bc.overdrive,
+                   (uint16_t)(((uint32_t)bc.alpha * mni + (uint32_t)cc.alpha * mi) >> 14));
+  }
+private:
+  RtColorNode* off_c_; RtColorNode* on_c_; RtColorNode* base_c_;
+  int off_pct_, off_rpm_, on_pct_, on_rpm_, fade_ms_;
+};
+
+// Pixelate<COLOR, N>: quantize color lookup by N LEDs
+class RtPixelate : public RtColorNode {
+public:
+  RtPixelate(RtColorNode* color, RtFuncNode* n) : color_(color), n_(n) {}
+  ~RtPixelate() override { delete color_; delete n_; }
+  void run(BladeBase* blade) override { color_->run(blade); n_->run(blade); }
+  RGBA_um getColor(int led) override {
+    int step = n_->getInteger(led);
+    if (step <= 1) return color_->getColor(led);
+    return color_->getColor((led / step) * step);
+  }
+private: RtColorNode* color_; RtFuncNode* n_;
+};
+
+// RGBCycle: cycles R→G→B each frame (matches ProffieOS RGBCycle::run())
+class RtRgbCycle : public RtColorNode {
+public:
+  void run(BladeBase*) override {
+    uint32_t now = millis();
+    if (now != last_) { last_ = now; n_ = (uint8_t)((n_ + 1) % 3); }
+  }
+  RGBA_um getColor(int) override {
+    switch (n_) {
+      case 0: return RGBA_um(Color16(65535,     0,     0), false, 32768);
+      case 1: return RGBA_um(Color16(    0, 65535,     0), false, 32768);
+      default: return RGBA_um(Color16(   0,     0, 65535), false, 32768);
+    }
+  }
+private: uint32_t last_ = 0; uint8_t n_ = 0;
+};
+
+// ColorSequence<MILLIS_PER_COLOR, C1, C2, ...>: cycles colors at fixed intervals
+class RtColorSequence : public RtColorNode {
+public:
+  RtColorSequence(int mpc, RtVec<RtColorNode*> colors)
+    : mpc_(mpc), colors_(rt_move(colors)) {}
+  ~RtColorSequence() override { for (auto* c : colors_) delete c; }
+  void run(BladeBase* blade) override {
+    for (auto* c : colors_) c->run(blade);
+    if (colors_.empty()) return;
+    uint32_t now = micros();
+    int32_t delta = (int32_t)(now - last_);
+    if (delta > mpc_ * 1000) {
+      if (delta > mpc_ * 10000) { n_ = 0; last_ = now; }
+      else { n_ = (n_ + 1) % (int)colors_.size(); last_ += (uint32_t)mpc_ * 1000; }
+    }
+  }
+  RGBA_um getColor(int led) override {
+    if (colors_.empty()) return RGBA_um::Transparent();
+    return colors_[n_]->getColor(led);
+  }
+private: int mpc_; RtVec<RtColorNode*> colors_; int n_ = 0; uint32_t last_ = 0;
+};
+
+// HardStripes: hard-edge color bands (no gradient — each pixel is 100% one color)
+class RtHardStripes : public RtColorNode {
+public:
+  RtHardStripes(RtFuncNode* width, RtFuncNode* speed, RtVec<RtColorNode*> colors)
+    : width_(width), speed_(speed), colors_(rt_move(colors)) {}
+  ~RtHardStripes() override {
+    delete width_; delete speed_;
+    for (auto* c : colors_) delete c;
+  }
+  void run(BladeBase* b) override {
+    width_->run(b); speed_->run(b);
+    for (auto* c : colors_) c->run(b);
+    nc_ = (int)colors_.size();
+    int width = width_->getInteger(0);
+    int speed = speed_->getInteger(0);
+    uint32_t now = micros();
+    int32_t delta = (int32_t)(now - last_); last_ = now;
+    int range = nc_ * 341 * 1024;
+    if (range > 0) {
+      m_ = (int32_t)(((int64_t)m_ + (int64_t)delta * speed / 333) % range);
+      if (m_ < 0) m_ += range;
+    }
+    mult_ = (width > 0) ? (50000 * 1024 / width) : 20480;
+  }
+  RGBA_um getColor(int led) override {
+    if (nc_ == 0) return RGBA_um::Transparent();
+    int p = (int)(((int64_t)m_ + (int64_t)led * mult_) >> 10) % (nc_ * 341);
+    if (p < 0) p += nc_ * 341;
+    int idx = p / 341; if (idx >= nc_) idx = nc_ - 1;
+    return colors_[idx]->getColor(led);
+  }
+private:
+  RtFuncNode* width_; RtFuncNode* speed_; RtVec<RtColorNode*> colors_;
+  int32_t m_ = 0; int32_t mult_ = 20480; uint32_t last_ = 0; int nc_ = 0;
+};
+
+// SimpleClashL<COLOR, MILLIS, EFFECT>: shows COLOR (with overdrive) for MILLIS when EFFECT fires
+class RtSimpleClashL : public RtColorNode {
+public:
+  RtSimpleClashL(RtColorNode* color, int millis, EffectType effect)
+    : color_(color), millis_(millis), effect_(effect) {}
+  ~RtSimpleClashL() override { delete color_; }
+  void run(BladeBase* blade) override {
+    color_->run(blade);
+    BladeEffect* effects; size_t n = SaberBase::GetEffects(&effects);
+    for (size_t i = 0; i < n; i++) {
+      if (effects[i].type == effect_ && effects[i].start_micros != last_us_) {
+        last_us_ = effects[i].start_micros; active_ = true;
+      }
+    }
+    if (active_ && (uint32_t)(micros() - last_us_) > (uint32_t)millis_ * 1000)
+      active_ = false;
+  }
+  RGBA_um getColor(int led) override {
+    if (!active_) return RGBA_um::Transparent();
+    RGBA_um c = color_->getColor(led); c.overdrive = true; return c;
+  }
+private: RtColorNode* color_; int millis_; EffectType effect_; uint32_t last_us_ = 0; bool active_ = false;
+};
+
 // Remap<FUNC, COLOR>: remap LED index
 class RtRemap : public RtColorNode {
 public:
@@ -1286,6 +1896,45 @@ public:
     return c_->getColor(rt_clamp(mapped, 0, n_ - 1));
   }
 private: RtFuncNode* f_; RtColorNode* c_; int n_ = 1;
+};
+
+// IgnitionDelayX<MILLIS, BASE>: delays is_on() seen by BASE by MILLIS milliseconds after blade-on.
+// Inherits IgnitionDelayBase<RtFuncAdapter> which IS a BladeWrapper — after Base::run(blade)
+// updates the delay state machine, passing `this` to base_->run() makes the child tree see
+// the delayed on-state. Intended for Kylo-style quillon blades.
+class RtIgnitionDelay : public RtColorNode, public IgnitionDelayBase<RtFuncAdapter> {
+  using Base = IgnitionDelayBase<RtFuncAdapter>;
+public:
+  RtIgnitionDelay(RtFuncNode* ms, RtColorNode* base) : base_(base) {
+    millis_.f_.node_ = ms;
+  }
+  ~RtIgnitionDelay() override { delete millis_.f_.node_; delete base_; }
+  void run(BladeBase* blade) override {
+    Base::run(blade);   // runs millis_, updates delay state, sets blade_
+    base_->run(this);   // child sees delayed is_on() via this BladeWrapper
+  }
+  RGBA_um getColor(int led) override { return base_->getColor(led); }
+private:
+  RtColorNode* base_;
+};
+
+// RetractionDelayX<MILLIS, BASE>: keeps is_on() true for MILLIS milliseconds after blade-off.
+// Mirror of RtIgnitionDelay — inherits RetractionDelayBase<RtFuncAdapter> (a BladeWrapper).
+// Base::run() handles the delay state; child sees delayed retraction via this BladeWrapper.
+class RtRetractionDelay : public RtColorNode, public RetractionDelayBase<RtFuncAdapter> {
+  using Base = RetractionDelayBase<RtFuncAdapter>;
+public:
+  RtRetractionDelay(RtFuncNode* ms, RtColorNode* base) : base_(base) {
+    millis_.f_.node_ = ms;
+  }
+  ~RtRetractionDelay() override { delete millis_.f_.node_; delete base_; }
+  void run(BladeBase* blade) override {
+    Base::run(blade);   // runs millis_, updates delay state, sets blade_
+    base_->run(this);   // child sees delayed is_on() via this BladeWrapper
+  }
+  RGBA_um getColor(int led) override { return base_->getColor(led); }
+private:
+  RtColorNode* base_;
 };
 
 // ---------------------------------------------------------------------------
@@ -2253,6 +2902,62 @@ RtColorNode* SDStyleParser::parseColor() {
                                  new RtIntConst(in_ms)))));
   }
 
+  // InOutSparkTipX<BASE, EXTENSION, SPARK_COLOR, OFF_COLOR>
+  if (!strcmp(name, "InOutSparkTipX")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base  = parseColor(); eatChar(',');
+    RtFuncNode*  ext   = parseFunc();
+    RtColorNode* spark = eatChar(',') ? parseColor() : new RtRgb(Color16(65535,65535,65535));
+    RtColorNode* off   = eatChar(',') ? parseColor() : new RtRgb(Color16());
+    skipToClose(); eatChar('>');
+    return new RtInOutSparkTipX(base, ext, spark, off);
+  }
+  // InOutSparkTip<BASE, OUT_MILLIS, IN_MILLIS, SPARK_COLOR, OFF_COLOR>
+  if (!strcmp(name, "InOutSparkTip")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base   = parseColor(); eatChar(',');
+    int          out_ms = parseInt();   eatChar(',');
+    int          in_ms  = parseInt();
+    RtColorNode* spark  = eatChar(',') ? parseColor() : new RtRgb(Color16(65535,65535,65535));
+    RtColorNode* off    = eatChar(',') ? parseColor() : new RtRgb(Color16());
+    skipToClose(); eatChar('>');
+    return new RtInOutSparkTipX(base,
+             new RtInOutFunc(new RtIntConst(out_ms), new RtIntConst(in_ms)),
+             spark, off);
+  }
+
+  // IgnitionDelayX<MILLIS_FUNC, BASE> / IgnitionDelay<MILLIS_INT, BASE>
+  if (!strcmp(name, "IgnitionDelayX")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode*  ms   = parseFuncOrInt(); eatChar(',');
+    RtColorNode* base = parseColor();
+    skipToClose(); eatChar('>');
+    return new RtIgnitionDelay(ms, base);
+  }
+  if (!strcmp(name, "IgnitionDelay")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode*  ms   = new RtIntConst(parseInt()); eatChar(',');
+    RtColorNode* base = parseColor();
+    skipToClose(); eatChar('>');
+    return new RtIgnitionDelay(ms, base);
+  }
+
+  // RetractionDelayX<MILLIS_FUNC, BASE> / RetractionDelay<MILLIS_INT, BASE>
+  if (!strcmp(name, "RetractionDelayX")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode*  ms   = parseFuncOrInt(); eatChar(',');
+    RtColorNode* base = parseColor();
+    skipToClose(); eatChar('>');
+    return new RtRetractionDelay(ms, base);
+  }
+  if (!strcmp(name, "RetractionDelay")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode*  ms   = new RtIntConst(parseInt()); eatChar(',');
+    RtColorNode* base = parseColor();
+    skipToClose(); eatChar('>');
+    return new RtRetractionDelay(ms, base);
+  }
+
   // InOutTr<BASE, OUT_TR, IN_TR, OFF> — simplified: just show BASE (no L suffix variant)
   if (!strcmp(name, "InOutTr")) {
     if (!eatChar('<')) return new RtRgb(Color16());
@@ -2581,6 +3286,282 @@ RtColorNode* SDStyleParser::parseColor() {
   // AlphaMixL: alias for AlphaL (already handled above, but add second form)
   // (handled in existing AlphaL branch via strcmp("AlphaMixL"))
 
+  // --- Gradient<C1, C2, ...> ---------------------------------------
+  if (!strcmp(name, "Gradient")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtVec<RtColorNode*> colors;
+    colors.push_back(parseColor());
+    while (eatChar(',')) { skipWS(); if (peekChar('>')) break; colors.push_back(parseColor()); }
+    eatChar('>');
+    if (colors.empty()) return new RtRgb(Color16());
+    return new RtGradient(rt_move(colors));
+  }
+
+  // --- Rainbow -----------------------------------------------------
+  if (!strcmp(name, "Rainbow")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtRainbow();
+  }
+
+  // --- ColorChange<TR, C1, C2, ...>: alias for ColorSelect with Variation ---
+  // Identical to ColorSelect but first arg is a transition (ignored)
+  if (!strcmp(name, "ColorChange")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    // Skip the transition argument
+    skipWS(); const char* saved = s_; char peek[64]; readIdent(peek, sizeof(peek)); s_ = saved;
+    if (strncmp(peek, "Tr", 2) == 0) { RtTransNode* t = parseTr(); delete t; eatChar(','); }
+    RtVec<RtColorNode*> colors;
+    do {
+      skipWS(); if (peekChar('>')) break;
+      const char* sv2 = s_; char pk2[64]; readIdent(pk2, sizeof(pk2)); s_ = sv2;
+      if (strncmp(pk2, "Tr", 2) == 0) { RtTransNode* t = parseTr(); delete t; }
+      else colors.push_back(parseColor());
+    } while (eatChar(','));
+    eatChar('>');
+    if (colors.empty()) return new RtRgb(Color16());
+    return new RtColorSelect(rt_move(colors));
+  }
+
+  // --- ColorCycle<OFF_C, OFF_PCT, OFF_RPM [, ON_C, ON_PCT, ON_RPM [, FADE_MS [, BASE_C]]]> ---
+  if (!strcmp(name, "ColorCycle")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* off_c  = parseColor(); eatChar(',');
+    int off_pct = parseInt(); eatChar(',');
+    int off_rpm = parseInt();
+    RtColorNode* on_c   = off_c;  // shallow copy via pointer; defer delete
+    int on_pct = off_pct, on_rpm = off_rpm, fade_ms = 1;
+    RtColorNode* base_c = new RtRgb(Color16());
+    bool owned_on = false;
+    if (eatChar(',')) {
+      // peek: is next a color?
+      skipWS(); const char* sv = s_; char pk[64]; readIdent(pk, sizeof(pk)); s_ = sv;
+      // Check if it looks like a color or a number
+      if (!isdigit((uint8_t)*s_) && *s_ != '-') {
+        on_c = parseColor(); owned_on = true; eatChar(',');
+        on_pct = parseInt(); eatChar(',');
+        on_rpm = parseInt();
+        if (eatChar(',')) {
+          fade_ms = parseInt();
+          if (eatChar(',')) { delete base_c; base_c = parseColor(); }
+        }
+      }
+    }
+    skipToClose(); eatChar('>');
+    // If on_c == off_c, duplicate it
+    if (!owned_on) on_c = new RtRgb(off_c->getColor(0).c);
+    return new RtColorCycle(off_c, off_pct, off_rpm, on_c, on_pct, on_rpm, fade_ms, base_c);
+  }
+
+  // --- Cylon<OFF_C, OFF_PCT, OFF_RPM [, ON_C, ON_PCT, ON_RPM [, FADE_MS [, BASE_C]]]> ---
+  if (!strcmp(name, "Cylon")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* off_c = parseColor(); eatChar(',');
+    int off_pct = parseInt(); eatChar(',');
+    int off_rpm = parseInt();
+    int on_pct = off_pct, on_rpm = off_rpm, fade_ms = 1;
+    RtColorNode* on_c   = nullptr;
+    RtColorNode* base_c = new RtRgb(Color16());
+    if (eatChar(',')) {
+      skipWS();
+      if (!isdigit((uint8_t)*s_) && *s_ != '-' && *s_ != '>') {
+        on_c = parseColor(); eatChar(',');
+        on_pct = parseInt(); eatChar(',');
+        on_rpm = parseInt();
+        if (eatChar(',')) {
+          fade_ms = parseInt();
+          if (eatChar(',')) { delete base_c; base_c = parseColor(); }
+        }
+      }
+    }
+    skipToClose(); eatChar('>');
+    if (!on_c) on_c = new RtRgb(off_c->getColor(0).c);
+    return new RtCylon(off_c, off_pct, off_rpm, on_c, on_pct, on_rpm, fade_ms, base_c);
+  }
+
+  // --- Pixelate<COLOR [, N]> / PixelateX<COLOR, N_FUNC> -----------
+  if (!strcmp(name, "Pixelate") || !strcmp(name, "PixelateX")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* c = parseColor();
+    RtFuncNode* n = eatChar(',') ? parseFuncOrInt() : new RtIntConst(2);
+    skipToClose(); eatChar('>');
+    return new RtPixelate(c, n);
+  }
+
+  // --- Sparkle<BASE, [COLOR, CHANCE, INTENSITY]> -------------------
+  if (!strcmp(name, "Sparkle")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base = parseColor();
+    RtColorNode* sc = eatChar(',') ? parseColor() : new RtRgb(Color16(65535, 65535, 65535));
+    int chance = eatChar(',') ? parseInt() : 300;
+    int intensity = eatChar(',') ? parseInt() : 1024;
+    skipToClose(); eatChar('>');
+    return new RtCompose(base, new RtAlphaL(sc, new RtSparkleF(chance, intensity)));
+  }
+
+  // --- SparkleL<COLOR [, CHANCE, INTENSITY]> -----------------------
+  if (!strcmp(name, "SparkleL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* sc = parseColor();
+    int chance    = eatChar(',') ? parseInt() : 300;
+    int intensity = eatChar(',') ? parseInt() : 1024;
+    skipToClose(); eatChar('>');
+    return new RtAlphaL(sc, new RtSparkleF(chance, intensity));
+  }
+
+  // --- RgbCycle (no args) -----------------------------------------
+  if (!strcmp(name, "RgbCycle") || !strcmp(name, "RGBCycle")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtRgbCycle();
+  }
+
+  // --- ColorSequence<MILLIS_PER_COLOR, C1, C2, ...> ---------------
+  if (!strcmp(name, "ColorSequence")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    int mpc = parseInt();
+    RtVec<RtColorNode*> colors;
+    while (eatChar(',')) { skipWS(); if (peekChar('>')) break; colors.push_back(parseColor()); }
+    eatChar('>');
+    if (colors.empty()) return new RtRgb(Color16());
+    return new RtColorSequence(mpc, rt_move(colors));
+  }
+
+  // --- OnSparkL<[COLOR, MILLIS]> / OnSparkX<BASE, COLOR, MILLIS> / OnSpark<BASE, COLOR, MILLIS> ---
+  if (!strcmp(name, "OnSparkL")) {
+    RtColorNode* sc = new RtRgb(Color16(65535, 65535, 65535));
+    RtFuncNode*  ms = new RtIntConst(200);
+    if (peekChar('<')) {
+      eatChar('<');
+      delete sc; sc = parseColor();
+      if (eatChar(',')) { delete ms; ms = parseFuncOrInt(); }
+      skipToClose(); eatChar('>');
+    }
+    return new RtAlphaL(sc, new RtOnSparkF(ms));
+  }
+  if (!strcmp(name, "OnSparkX") || !strcmp(name, "OnSpark")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base = parseColor();
+    RtColorNode* sc = new RtRgb(Color16(65535, 65535, 65535));
+    RtFuncNode*  ms = new RtIntConst(200);
+    if (eatChar(',')) {
+      delete sc; sc = parseColor();
+      if (eatChar(',')) { delete ms; ms = parseFuncOrInt(); }
+    }
+    skipToClose(); eatChar('>');
+    return new RtCompose(base, new RtAlphaL(sc, new RtOnSparkF(ms)));
+  }
+
+  // --- Blast<BASE, BLAST [, FADE, SIZE, MS, EFFECT]> ---------------
+  if (!strcmp(name, "Blast")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base  = parseColor(); eatChar(',');
+    RtColorNode* blast = parseColor();
+    int fade = 200, size = 100, ms = 400; EffectType et = EFFECT_BLAST;
+    if (eatChar(',')) { fade = parseInt();
+      if (eatChar(',')) { size = parseInt();
+        if (eatChar(',')) { ms = parseInt();
+          if (eatChar(',')) et = parseEffectType(); } } }
+    skipToClose(); eatChar('>');
+    return new RtCompose(base, new RtAlphaL(blast, new RtBlastF(fade, size, ms, et)));
+  }
+
+  // --- BlastFadeoutL<BLAST [, FADE, EFFECT]> -----------------------
+  if (!strcmp(name, "BlastFadeoutL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* blast = parseColor();
+    int fade = 250; EffectType et = EFFECT_BLAST;
+    if (eatChar(',')) { fade = parseInt(); if (eatChar(',')) et = parseEffectType(); }
+    skipToClose(); eatChar('>');
+    return new RtAlphaL(blast, new RtBlastFadeoutF(fade, et));
+  }
+
+  // --- BlastFadeout<BASE, BLAST [, FADE, EFFECT]> ------------------
+  if (!strcmp(name, "BlastFadeout")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base  = parseColor(); eatChar(',');
+    RtColorNode* blast = parseColor();
+    int fade = 250; EffectType et = EFFECT_BLAST;
+    if (eatChar(',')) { fade = parseInt(); if (eatChar(',')) et = parseEffectType(); }
+    skipToClose(); eatChar('>');
+    return new RtCompose(base, new RtAlphaL(blast, new RtBlastFadeoutF(fade, et)));
+  }
+
+  // --- OriginalBlastL<BLAST [, EFFECT]> ----------------------------
+  if (!strcmp(name, "OriginalBlastL")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* blast = parseColor();
+    EffectType et = EFFECT_BLAST;
+    if (eatChar(',')) et = parseEffectType();
+    skipToClose(); eatChar('>');
+    return new RtAlphaL(blast, new RtBlastF(200, 100, 400, et));
+  }
+
+  // --- OriginalBlast<BASE, BLAST [, EFFECT]> -----------------------
+  if (!strcmp(name, "OriginalBlast")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base  = parseColor(); eatChar(',');
+    RtColorNode* blast = parseColor();
+    EffectType et = EFFECT_BLAST;
+    if (eatChar(',')) et = parseEffectType();
+    skipToClose(); eatChar('>');
+    return new RtCompose(base, new RtAlphaL(blast, new RtBlastF(200, 100, 400, et)));
+  }
+
+  // --- SimpleClashL<[COLOR, MILLIS, EFFECT, STAB_SHAPE]> ----------
+  if (!strcmp(name, "SimpleClashL")) {
+    RtColorNode* color = new RtRgb(Color16(65535, 65535, 65535));
+    int millis = 40; EffectType et = EFFECT_CLASH;
+    if (peekChar('<')) {
+      eatChar('<');
+      delete color; color = parseColor();
+      if (eatChar(',')) { millis = parseInt();
+        if (eatChar(',')) et = parseEffectType(); }
+      skipToClose(); eatChar('>');
+    }
+    return new RtSimpleClashL(color, millis, et);
+  }
+
+  // --- SimpleClash<BASE [, COLOR, MILLIS, EFFECT, STAB_SHAPE]> ----
+  if (!strcmp(name, "SimpleClash")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base  = parseColor();
+    RtColorNode* color = new RtRgb(Color16(65535, 65535, 65535));
+    int millis = 40; EffectType et = EFFECT_CLASH;
+    if (eatChar(',')) {
+      delete color; color = parseColor();
+      if (eatChar(',')) { millis = parseInt();
+        if (eatChar(',')) et = parseEffectType(); }
+    }
+    skipToClose(); eatChar('>');
+    return new RtCompose(base, new RtSimpleClashL(color, millis, et));
+  }
+
+  // --- LocalizedClash<BASE, ...> (base + LocalizedClashL) ----------
+  if (!strcmp(name, "LocalizedClash")) {
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtColorNode* base  = parseColor();
+    RtColorNode* color = new RtRgb(Color16(65535, 65535, 65535));
+    int millis = 40, width_pct = 50; EffectType et = EFFECT_CLASH;
+    if (eatChar(',')) { delete color; color = parseColor();
+      if (eatChar(',')) { millis = parseInt();
+        if (eatChar(',')) { width_pct = parseInt();
+          if (eatChar(',')) et = parseEffectType(); } } }
+    skipToClose(); eatChar('>');
+    return new RtCompose(base, new RtAlphaL(color, new RtLocalizedClashF(millis, width_pct, et)));
+  }
+
+  // --- HardStripes<WIDTH, SPEED, C1, ...> / HardStripesX<WF, SF, C1, ...> ---
+  if (!strcmp(name, "HardStripes") || !strcmp(name, "HardStripesX")) {
+    bool is_x = !strcmp(name, "HardStripesX");
+    if (!eatChar('<')) return new RtRgb(Color16());
+    RtFuncNode* width = is_x ? parseFuncOrInt() : new RtIntConst(parseInt()); eatChar(',');
+    RtFuncNode* speed = is_x ? parseFuncOrInt() : new RtIntConst(parseInt());
+    RtVec<RtColorNode*> colors;
+    while (eatChar(',')) { skipWS(); if (peekChar('>')) break; colors.push_back(parseColor()); }
+    eatChar('>');
+    if (colors.empty()) { delete width; delete speed; return new RtRgb(Color16()); }
+    return new RtHardStripes(width, speed, rt_move(colors));
+  }
+
   // --- Named colors (no template args) ----------------------------
   RtColorNode* nc = sd_named_color(name);
   if (nc) return nc;
@@ -2708,10 +3689,16 @@ RtFuncNode* SDStyleParser::parseFunc() {
     return new RtHumpFlickerF(w);
   }
 
-  // RandomPerLEDF
-  if (!strcmp(name, "RandomPerLEDF") || !strcmp(name, "RandomF")) {
+  // RandomPerLEDF: per-LED (different for each LED each frame)
+  if (!strcmp(name, "RandomPerLEDF")) {
     if (peekChar('<')) skipTemplateArgs();
     return new RtRandomPerLEDF();
+  }
+
+  // RandomF: per-frame (same value for all LEDs that frame)
+  if (!strcmp(name, "RandomF")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtRandomF();
   }
 
   // BrownNoiseF<GRADE>
@@ -2870,14 +3857,16 @@ RtFuncNode* SDStyleParser::parseFunc() {
     return new RtHoldPeakF(f, hold, sp);
   }
 
-  // Trigger<EFFECT, UP_MS, DOWN_MS, ZERO_VALUE>
+  // Trigger<EFFECT, FADE_IN_MILLIS, SUSTAIN_MILLIS, FADE_OUT_MILLIS [,DELAY_MILLIS]>
   if (!strcmp(name, "Trigger")) {
     if (!eatChar('<')) return new RtIntConst(0);
-    EffectType et = parseEffectType(); eatChar(',');
-    RtFuncNode* up   = parseFuncOrInt(); eatChar(',');
-    RtFuncNode* down = parseFuncOrInt(); eatChar(',');
-    RtFuncNode* zero = parseFuncOrInt(); skipToClose(); eatChar('>');
-    return new RtTrigger(et, up, down, zero);
+    EffectType et       = parseEffectType();  eatChar(',');
+    RtFuncNode* fade_in = parseFuncOrInt();   eatChar(',');
+    RtFuncNode* sustain = parseFuncOrInt();   eatChar(',');
+    RtFuncNode* fade_out = parseFuncOrInt();
+    RtFuncNode* delay = eatChar(',') ? parseFuncOrInt() : nullptr;
+    skipToClose(); eatChar('>');
+    return new RtTrigger(et, fade_in, sustain, fade_out, delay);
   }
 
   // EffectRandomF<EFFECT>
@@ -2940,6 +3929,247 @@ RtFuncNode* SDStyleParser::parseFunc() {
     RtFuncNode* ms = parseFuncOrInt();
     skipToClose(); eatChar('>');
     return ms;
+  }
+
+  // InvertF<F> = Scale<F, Int<32768>, Int<0>>
+  if (!strcmp(name, "InvertF")) {
+    if (!eatChar('<')) return new RtIntConst(16384);
+    RtFuncNode* f = parseFuncOrInt(); eatChar('>');
+    return new RtScale(f, new RtIntConst(32768), new RtIntConst(0));
+  }
+
+  // Add<A, B, ...>: alias for Sum (variadic)
+  if (!strcmp(name, "Add")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* result = parseFuncOrInt();
+    while (eatChar(',')) {
+      skipWS(); if (peekChar('>')) break;
+      result = new RtSum(result, parseFuncOrInt());
+    }
+    eatChar('>');
+    return result;
+  }
+
+  // Subtract<A, B>
+  if (!strcmp(name, "Subtract")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* a = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* b = parseFuncOrInt(); eatChar('>');
+    return new RtSubtract(a, b);
+  }
+
+  // AbsF<F>
+  if (!strcmp(name, "AbsF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f = parseFuncOrInt(); eatChar('>');
+    return new RtAbsF(f);
+  }
+
+  // ClampF<F, [MIN, MAX]> / ClampFX<F, MIN_F, MAX_F>
+  if (!strcmp(name, "ClampF") || !strcmp(name, "ClampFX")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f  = parseFuncOrInt();
+    RtFuncNode* mn = eatChar(',') ? parseFuncOrInt() : new RtIntConst(0);
+    RtFuncNode* mx = eatChar(',') ? parseFuncOrInt() : new RtIntConst(32768);
+    skipToClose(); eatChar('>');
+    return new RtClampF(f, mn, mx);
+  }
+
+  // Divide<F, V>
+  if (!strcmp(name, "Divide")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* v = parseFuncOrInt(); eatChar('>');
+    return new RtDivide(f, v);
+  }
+
+  // IsBetween<F, MIN, MAX>
+  if (!strcmp(name, "IsBetween")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f  = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* mn = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* mx = parseFuncOrInt(); eatChar('>');
+    return new RtIsBetween(f, mn, mx);
+  }
+
+  // TimeSinceEffect<[EFFECT]>
+  if (!strcmp(name, "TimeSinceEffect")) {
+    EffectType et = EFFECT_NONE;
+    if (peekChar('<')) { eatChar('<'); et = parseEffectType(); skipToClose(); eatChar('>'); }
+    return new RtTimeSinceEffect(et);
+  }
+
+  // VolumeLevel
+  if (!strcmp(name, "VolumeLevel")) {
+    if (peekChar('<')) skipTemplateArgs();
+    return new RtVolumeLevel();
+  }
+
+  // WavNum<[EFFECT]>
+  if (!strcmp(name, "WavNum")) {
+    EffectType et = EFFECT_NONE;
+    if (peekChar('<')) { eatChar('<'); et = parseEffectType(); skipToClose(); eatChar('>'); }
+    return new RtWavNum(et);
+  }
+
+  // ChangeSlowly<F, SPEED>
+  if (!strcmp(name, "ChangeSlowly")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* sp = parseFuncOrInt(); skipToClose(); eatChar('>');
+    return new RtChangeSlowly(f, sp);
+  }
+
+  // CenterDistF<[CENTER]>
+  if (!strcmp(name, "CenterDistF")) {
+    RtFuncNode* center = new RtIntConst(16384);
+    if (peekChar('<')) { eatChar('<'); delete center; center = parseFuncOrInt(); skipToClose(); eatChar('>'); }
+    return new RtCenterDistF(center);
+  }
+
+  // LinearSectionF<POSITION, FRACTION>
+  if (!strcmp(name, "LinearSectionF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* pos  = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* frac = parseFuncOrInt(); skipToClose(); eatChar('>');
+    return new RtLinearSectionF(pos, frac);
+  }
+
+  // CircularSectionF<POSITION, FRACTION>
+  if (!strcmp(name, "CircularSectionF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* pos  = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* frac = parseFuncOrInt(); skipToClose(); eatChar('>');
+    return new RtCircularSectionF(pos, frac);
+  }
+
+  // IncrementModuloF<PULSE, [MAX, INCREMENT]>
+  if (!strcmp(name, "IncrementModuloF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* pulse = parseFuncOrInt();
+    RtFuncNode* max   = eatChar(',') ? parseFuncOrInt() : new RtIntConst(32768);
+    RtFuncNode* incr  = eatChar(',') ? parseFuncOrInt() : new RtIntConst(1);
+    skipToClose(); eatChar('>');
+    return new RtIncrementModuloF(pulse, max, incr);
+  }
+
+  // IncrementWithReset<PULSE, RESET, [MAX, I]>
+  if (!strcmp(name, "IncrementWithReset")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* pulse = parseFuncOrInt(); eatChar(',');
+    RtFuncNode* reset = parseFuncOrInt();
+    RtFuncNode* max   = eatChar(',') ? parseFuncOrInt() : new RtIntConst(32768);
+    RtFuncNode* incr  = eatChar(',') ? parseFuncOrInt() : new RtIntConst(1);
+    skipToClose(); eatChar('>');
+    return new RtIncrementWithResetF(pulse, reset, max, incr);
+  }
+
+  // ThresholdPulseF<F, [THRESHOLD, HYST_PCT]>
+  if (!strcmp(name, "ThresholdPulseF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f   = parseFuncOrInt();
+    RtFuncNode* thr = eatChar(',') ? parseFuncOrInt() : new RtIntConst(32768);
+    int hyst = 66;
+    if (eatChar(',')) hyst = parseInt();
+    skipToClose(); eatChar('>');
+    return new RtThresholdPulseF(f, thr, hyst);
+  }
+
+  // IncrementF<F, V, MAX, I, HYST_PCT>: alias = IncrementModuloF(ThresholdPulseF(F,V,HYST), MAX, I)
+  if (!strcmp(name, "IncrementF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* f   = parseFuncOrInt();
+    RtFuncNode* v   = eatChar(',') ? parseFuncOrInt() : new RtIntConst(32768);
+    RtFuncNode* max = eatChar(',') ? parseFuncOrInt() : new RtIntConst(32768);
+    RtFuncNode* i   = eatChar(',') ? parseFuncOrInt() : new RtIntConst(1);
+    int hyst = 66;
+    if (eatChar(',')) hyst = parseInt();
+    skipToClose(); eatChar('>');
+    RtFuncNode* pulse = new RtThresholdPulseF(f, v, hyst);
+    return new RtIncrementModuloF(pulse, max, i);
+  }
+
+  // EffectIncrementF<EFFECT, [MAX, I]>: increment on each effect
+  if (!strcmp(name, "EffectIncrementF")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    EffectType et = parseEffectType();
+    RtFuncNode* max = eatChar(',') ? parseFuncOrInt() : new RtIntConst(32768);
+    RtFuncNode* incr = eatChar(',') ? parseFuncOrInt() : new RtIntConst(1);
+    skipToClose(); eatChar('>');
+    // Pulse = EffectRandomF (fires once per event)
+    return new RtIncrementModuloF(new RtEffectRandomF(et), max, incr);
+  }
+
+  // RandomBlinkF<MILLIHZ>
+  if (!strcmp(name, "RandomBlinkF")) {
+    if (!eatChar('<')) return new RtRandomBlinkF(new RtIntConst(1000));
+    RtFuncNode* mhz = parseFuncOrInt(); eatChar('>');
+    return new RtRandomBlinkF(mhz);
+  }
+
+  // SparkleF<[CHANCE_PROMILLE, INTENSITY]>
+  if (!strcmp(name, "SparkleF")) {
+    int chance = 300, intensity = 1024;
+    if (peekChar('<')) {
+      eatChar('<');
+      chance = parseInt();
+      if (eatChar(',')) intensity = parseInt();
+      skipToClose(); eatChar('>');
+    }
+    return new RtSparkleF(chance, intensity);
+  }
+
+  // OnSparkF<[MILLIS]>: 32768→0 fade over MILLIS after blade-on
+  if (!strcmp(name, "OnSparkF")) {
+    RtFuncNode* ms = new RtIntConst(200);
+    if (peekChar('<')) { eatChar('<'); delete ms; ms = parseFuncOrInt(); skipToClose(); eatChar('>'); }
+    return new RtOnSparkF(ms);
+  }
+
+  // BlastFadeoutF<[FADE_MS, EFFECT]>
+  if (!strcmp(name, "BlastFadeoutF")) {
+    int fade = 250; EffectType et = EFFECT_BLAST;
+    if (peekChar('<')) {
+      eatChar('<'); fade = parseInt();
+      if (eatChar(',')) et = parseEffectType();
+      skipToClose(); eatChar('>');
+    }
+    return new RtBlastFadeoutF(fade, et);
+  }
+
+  // OriginalBlastF<[EFFECT]>: approximate as BlastF (close enough for runtime use)
+  if (!strcmp(name, "OriginalBlastF")) {
+    EffectType et = EFFECT_BLAST;
+    if (peekChar('<')) { eatChar('<'); et = parseEffectType(); skipToClose(); eatChar('>'); }
+    return new RtBlastF(200, 100, 400, et);
+  }
+
+  // IntSelect<F, N1, N2, ...>: returns constants selected by F
+  if (!strcmp(name, "IntSelect")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* sel = parseFuncOrInt();
+    RtVec<RtFuncNode*> funcs;
+    while (eatChar(',')) {
+      skipWS(); if (peekChar('>')) break;
+      funcs.push_back(new RtIntConst(parseInt()));
+    }
+    eatChar('>');
+    if (funcs.empty()) { delete sel; return new RtIntConst(0); }
+    return new RtIntSelectX(sel, rt_move(funcs));
+  }
+
+  // IntSelectX<F, F1, F2, ...>: returns function selected by F
+  if (!strcmp(name, "IntSelectX")) {
+    if (!eatChar('<')) return new RtIntConst(0);
+    RtFuncNode* sel = parseFuncOrInt();
+    RtVec<RtFuncNode*> funcs;
+    while (eatChar(',')) {
+      skipWS(); if (peekChar('>')) break;
+      funcs.push_back(parseFuncOrInt());
+    }
+    eatChar('>');
+    if (funcs.empty()) { delete sel; return new RtIntConst(0); }
+    return new RtIntSelectX(sel, rt_move(funcs));
   }
 
   // Unknown function
