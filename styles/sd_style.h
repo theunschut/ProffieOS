@@ -2433,15 +2433,6 @@ public:
   void run(BladeBase* b) override {
     off_->run(b);
     bool on = b->is_on();
-    // On first run, if the blade is already on, skip the ignition animation.
-    if (!initialized_) {
-      initialized_ = true;
-      STDOUT.print("InOutTrL init: blade=");
-      STDOUT.print(b->GetBladeNumber());
-      STDOUT.print(" is_on=");
-      STDOUT.println(on ? "true" : "false");
-      if (on) { state_ = ON_IDLE; return; }
-    }
     switch (state_) {
       case OFF_IDLE:
         if (on) { state_ = IGNITING; tr_in_->begin(); tr_in_->run(b); }
@@ -2476,7 +2467,6 @@ public:
 private:
   RtTransNode* tr_in_; RtTransNode* tr_out_; RtColorNode* off_;
   State state_ = OFF_IDLE;
-  bool initialized_ = false;
 };
 
 // TransitionLoopL<TR>: continuously loops a transition

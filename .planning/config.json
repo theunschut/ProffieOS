@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "project": "ProffieOS Style Parser: SD Card Runtime Loading",
+  "workflowPreferences": {
+    "useResearch": false,
+    "parallelPhases": false,
+    "autoCommit": true,
+    "modelProfile": "balanced"
+  },
+  "gitSettings": {
+    "workingBranch": "feature/StyleFromSD",
+    "baseBranch": "master",
+    "commitPrefix": "[StyleParser]"
+  },
+  "teamPreferences": {
+    "requireCodeReview": false,
+    "requestedReviewer": "profezzorn (optional)",
+    "communicationStyle": "technical, direct"
+  },
+  "projectMetadata": {
+    "createdDate": "2026-03-25",
+    "estimatedDuration": "1-2 weeks",
+    "phaseCount": 6,
+    "criticality": "medium (storage improvement, not critical feature)"
+  }
+}
