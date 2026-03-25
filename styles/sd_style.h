@@ -155,7 +155,7 @@ public:
   explicit RtRgb(Color16 c, bool overdrive = false)
     : pixel_(c, overdrive, 32768) {}
   void run(BladeBase*) override {}
-  RGBA_um getColor(int) override { return pixel_; }
+  RGBA_um getColor(int) override __attribute__((always_inline)) { return pixel_; }
 private:
   RGBA_um pixel_;
 };
@@ -179,7 +179,7 @@ public:
   RtCompose(RtColorNode* base, RtColorNode* layer) : base_(base), layer_(layer) {}
   ~RtCompose() override { delete base_; delete layer_; }
   void run(BladeBase* blade) override { base_->run(blade); layer_->run(blade); }
-  RGBA_um getColor(int led) override {
+  RGBA_um getColor(int led) override __attribute__((always_inline)) {
     return rt_compose(base_->getColor(led), layer_->getColor(led));
   }
 private:
@@ -215,7 +215,7 @@ class RtRgba : public RtColorNode {
 public:
   explicit RtRgba(RGBA_um p) : p_(p) {}
   void run(BladeBase*) override {}
-  RGBA_um getColor(int) override { return p_; }
+  RGBA_um getColor(int) override __attribute__((always_inline)) { return p_; }
 private:
   RGBA_um p_;
 };
@@ -254,7 +254,7 @@ class RtIntConst : public RtFuncNode {
 public:
   explicit RtIntConst(int n) : n_(n) {}
   void run(BladeBase*) override {}
-  int getInteger(int) override { return n_; }
+  int getInteger(int) override __attribute__((always_inline)) { return n_; }
 private:
   int n_;
 };
