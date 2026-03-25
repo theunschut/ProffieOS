@@ -721,6 +721,17 @@ public:
   void run(BladeBase* b) override {
     n_ = b->num_leds();
     num_blasts_ = SaberBase::GetEffects(&effects_);
+    // Update power state: can power off when all active blasts have faded
+    active_blast_ = false;
+    for (size_t i = 0; i < num_blasts_; i++) {
+      if (effects_[i].type != effect_) continue;
+      uint32_t T = micros() - effects_[i].start_micros;
+      int M = 1000 - (int)(T / (uint32_t)fade_ms_);
+      if (M > 0) {
+        active_blast_ = true;
+        break;
+      }
+    }
   }
   int getInteger(int led) override {
     int mix = 0;
@@ -736,11 +747,14 @@ public:
     }
     return rt_clamp(mix << 7, 0, 32768);
   }
+  // Power control: Can power off when blast has faded (no active effects)
+  bool canPowerOff() override { return !active_blast_; }
 private:
   int fade_ms_, wave_size_, wave_ms_, n_ = 1;
   EffectType effect_;
   size_t num_blasts_ = 0;
   BladeEffect* effects_ = nullptr;
+  bool active_blast_ = false;  // Tracks if any blast effect is still active
 };
 
 // LocalizedClashF<FADE_MS, WIDTH_PCT, EFFECT>: static bump at clash point, fades over time
@@ -752,6 +766,17 @@ public:
   void run(BladeBase* b) override {
     n_ = b->num_leds();
     num_effects_ = SaberBase::GetEffects(&effects_);
+    // Update power state: can power off when all active clashes have faded
+    active_effect_ = false;
+    for (size_t i = 0; i < num_effects_; i++) {
+      if (effects_[i].type != effect_) continue;
+      uint32_t T = micros() - effects_[i].start_micros;
+      int M = 1000 - (int)(T * 1000u / (uint32_t)fade_ms_);
+      if (M > 0) {
+        active_effect_ = true;
+        break;
+      }
+    }
   }
   int getInteger(int led) override {
     int mix = 0;
@@ -772,11 +797,14 @@ public:
     }
     return rt_clamp(mix << 7, 0, 32768);
   }
+  // Power control: Can power off when effect has faded (no active effects)
+  bool canPowerOff() override { return !active_effect_; }
 private:
   int fade_ms_, width_pct_, n_ = 1;
   EffectType effect_;
   size_t num_effects_ = 0;
   BladeEffect* effects_ = nullptr;
+  bool active_effect_ = false;  // Tracks if any effect is still active
 };
 
 // BrownNoiseF<GRADE>: per-LED correlated random walk
@@ -1375,7 +1403,20 @@ private: RtFuncNode* ms_; bool on_ = false; uint32_t on_millis_ = 0;
 class RtBlastFadeoutF : public RtFuncNode {
 public:
   RtBlastFadeoutF(int fade_ms, EffectType effect) : fade_ms_(fade_ms), effect_(effect) {}
-  void run(BladeBase* b) override { num_blasts_ = SaberBase::GetEffects(&effects_); }
+  void run(BladeBase* b) override {
+    num_blasts_ = SaberBase::GetEffects(&effects_);
+    // Update power state: can power off when all active blasts have faded
+    active_blast_ = false;
+    for (size_t i = 0; i < num_blasts_; i++) {
+      if (effects_[i].type != effect_) continue;
+      uint32_t T = micros() - effects_[i].start_micros;
+      int M = 1000 - (int)(T / (uint32_t)fade_ms_);
+      if (M > 0) {
+        active_blast_ = true;
+        break;
+      }
+    }
+  }
   int getInteger(int) override {
     int mix = 0;
     for (size_t i = 0; i < num_blasts_; i++) {
@@ -1386,7 +1427,14 @@ public:
     }
     return rt_clamp(mix, 0, 32768);
   }
-private: int fade_ms_; EffectType effect_; size_t num_blasts_ = 0; BladeEffect* effects_ = nullptr;
+  // Power control: Can power off when blast has faded (no active effects)
+  bool canPowerOff() override { return !active_blast_; }
+private:
+  int fade_ms_;
+  EffectType effect_;
+  size_t num_blasts_ = 0;
+  BladeEffect* effects_ = nullptr;
+  bool active_blast_ = false;  // Tracks if any blast effect is still active
 };
 
 // IntSelectX<F, N1, N2, ...>: pick from a list of functions by index F
