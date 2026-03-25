@@ -37,18 +37,6 @@
 #include "ignition_delay.h"           // IgnitionDelayBase
 #include "retraction_delay.h"         // RetractionDelayBase
 
-// MixColors overload for RGBA_um — needed so InOutSparkTipX<RtColorAdapter,...>::getColor()
-// can resolve its decltype return type when instantiated with runtime adapters.
-inline RGBA_um MixColors(RGBA_um a, RGBA_um b, int x, int shift) {
-  int ax = (1 << shift) - x;
-  return RGBA_um(
-    ((a.c * (uint16_t)ax) + (b.c * (uint16_t)x)) >> shift,
-    x > (1 << (shift - 1)) ? b.overdrive : a.overdrive,
-    (uint16_t)(((uint32_t)a.alpha * (uint16_t)ax + (uint32_t)b.alpha * (uint16_t)x
-                + ((1 << shift) - 1)) >> shift)
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Architecture Overview
 // ---------------------------------------------------------------------------
@@ -4379,17 +4367,6 @@ public:
                     || buf[len-1] == ' '  || buf[len-1] == '\t'))
       --len;
     buf[len] = '\0';
-
-    STDOUT.print("[DEBUG] SDStyle: loaded '"); STDOUT.print(resolved_path);
-    STDOUT.print("' ("); STDOUT.print(len); STDOUT.println(" bytes)");
-    // Print first 80 chars so you can verify the file content in Serial Monitor
-    STDOUT.print("[DEBUG] SDStyle: content[0..80]: '");
-    for (int i = 0; i < 80 && i < len; i++) {
-      char c = buf[i];
-      if (c == '\r' || c == '\n') STDOUT.print(' ');
-      else STDOUT.print(c);
-    }
-    STDOUT.println("'");
 
     SDStyleParser parser(buf, len);
     RtColorNode* root = parser.parseColor();
