@@ -1518,8 +1518,10 @@ private: RtFuncNode* angle_; RtColorNode* color_;
 // WIDTH and SPEED use the same scale as ProffieOS: WIDTH~1000 for normal, SPEED units/ms
 class RtStripes : public RtColorNode {
 public:
-  RtStripes(RtFuncNode* width, RtFuncNode* speed, RtVec<RtColorNode*> colors)
-    : width_(width), speed_(speed), colors_(rt_move(colors)) {}
+  // hard_edge=false: smooth blending with sine table (default Stripes)
+  // hard_edge=true: hard-edged color selection (HardStripes)
+  RtStripes(RtFuncNode* width, RtFuncNode* speed, RtVec<RtColorNode*> colors, bool hard_edge = false)
+    : width_(width), speed_(speed), colors_(rt_move(colors)), hard_edge_(hard_edge) {}
   ~RtStripes() override {
     delete width_; delete speed_;
     for (auto* c : colors_) delete c;
@@ -1547,27 +1549,35 @@ public:
     // p = ((m + led * mult_) >> 10) % (nc * 341)  — matches ProffieOS exactly
     int p = (int)(((int64_t)m_ + (int64_t)led * mult_) >> 10) % (nc_ * 341);
     if (p < 0) p += nc_ * 341;
-    // Blend colors using sin_table (half-sine blend, same as ProffieOS StripesHelper::get)
-    Color16 ret(0, 0, 0);
-    auto blend_in = [&](int pp) {
-      for (int i = 0; i < nc_; i++, pp -= 341) {
-        if (pp > 0 && pp < 512) {
-          RGBA_um c = colors_[i]->getColor(led);
-          int mul = sin_table[pp];
-          ret.r = rt_clamp(ret.r + (int)((c.c.r * mul) >> 14), 0, 65535);
-          ret.g = rt_clamp(ret.g + (int)((c.c.g * mul) >> 14), 0, 65535);
-          ret.b = rt_clamp(ret.b + (int)((c.c.b * mul) >> 14), 0, 65535);
+
+    if (hard_edge_) {
+      // Hard-edged: direct color selection
+      int idx = p / 341; if (idx >= nc_) idx = nc_ - 1;
+      return colors_[idx]->getColor(led);
+    } else {
+      // Smooth blend using sin_table (half-sine blend, same as ProffieOS StripesHelper::get)
+      Color16 ret(0, 0, 0);
+      auto blend_in = [&](int pp) {
+        for (int i = 0; i < nc_; i++, pp -= 341) {
+          if (pp > 0 && pp < 512) {
+            RGBA_um c = colors_[i]->getColor(led);
+            int mul = sin_table[pp];
+            ret.r = rt_clamp(ret.r + (int)((c.c.r * mul) >> 14), 0, 65535);
+            ret.g = rt_clamp(ret.g + (int)((c.c.g * mul) >> 14), 0, 65535);
+            ret.b = rt_clamp(ret.b + (int)((c.c.b * mul) >> 14), 0, 65535);
+          }
         }
-      }
-    };
-    blend_in(p);
-    blend_in(p + nc_ * 341);  // wrap-around pass (ProffieOS does this too)
-    return RGBA_um{ ret, false, 32768 };
+      };
+      blend_in(p);
+      blend_in(p + nc_ * 341);  // wrap-around pass (ProffieOS does this too)
+      return RGBA_um{ ret, false, 32768 };
+    }
   }
 private:
   RtFuncNode* width_; RtFuncNode* speed_;
   RtVec<RtColorNode*> colors_;
   int32_t m_ = 0; uint32_t last_ = 0; int nc_ = 0; uint32_t mult_ = 20480;
+  bool hard_edge_;
 };
 
 // StyleFire: simplified fire simulation
@@ -1826,41 +1836,6 @@ private: int mpc_; RtVec<RtColorNode*> colors_; int n_ = 0; uint32_t last_ = 0;
 };
 
 // HardStripes: hard-edge color bands (no gradient — each pixel is 100% one color)
-class RtHardStripes : public RtColorNode {
-public:
-  RtHardStripes(RtFuncNode* width, RtFuncNode* speed, RtVec<RtColorNode*> colors)
-    : width_(width), speed_(speed), colors_(rt_move(colors)) {}
-  ~RtHardStripes() override {
-    delete width_; delete speed_;
-    for (auto* c : colors_) delete c;
-  }
-  void run(BladeBase* b) override {
-    width_->run(b); speed_->run(b);
-    for (auto* c : colors_) c->run(b);
-    nc_ = (int)colors_.size();
-    int width = width_->getInteger(0);
-    int speed = speed_->getInteger(0);
-    uint32_t now = micros();
-    int32_t delta = (int32_t)(now - last_); last_ = now;
-    int range = nc_ * 341 * 1024;
-    if (range > 0) {
-      m_ = (int32_t)(((int64_t)m_ + (int64_t)delta * speed / 333) % range);
-      if (m_ < 0) m_ += range;
-    }
-    mult_ = (width > 0) ? (50000 * 1024 / width) : 20480;
-  }
-  RGBA_um getColor(int led) override {
-    if (nc_ == 0) return RGBA_um::Transparent();
-    int p = (int)(((int64_t)m_ + (int64_t)led * mult_) >> 10) % (nc_ * 341);
-    if (p < 0) p += nc_ * 341;
-    int idx = p / 341; if (idx >= nc_) idx = nc_ - 1;
-    return colors_[idx]->getColor(led);
-  }
-private:
-  RtFuncNode* width_; RtFuncNode* speed_; RtVec<RtColorNode*> colors_;
-  int32_t m_ = 0; int32_t mult_ = 20480; uint32_t last_ = 0; int nc_ = 0;
-};
-
 // SimpleClashL<COLOR, MILLIS, EFFECT>: shows COLOR (with overdrive) for MILLIS when EFFECT fires
 class RtSimpleClashL : public RtColorNode {
 public:
@@ -3540,6 +3515,7 @@ RtColorNode* SDStyleParser::parseColor() {
   }
 
   // --- HardStripes<WIDTH, SPEED, C1, ...> / HardStripesX<WF, SF, C1, ...> ---
+  // Consolidated into RtStripes with hard_edge=true
   if (!strcmp(name, "HardStripes") || !strcmp(name, "HardStripesX")) {
     bool is_x = !strcmp(name, "HardStripesX");
     if (!eatChar('<')) return new RtRgb(Color16());
@@ -3549,7 +3525,7 @@ RtColorNode* SDStyleParser::parseColor() {
     while (eatChar(',')) { skipWS(); if (peekChar('>')) break; colors.push_back(parseColor()); }
     eatChar('>');
     if (colors.empty()) { delete width; delete speed; return new RtRgb(Color16()); }
-    return new RtHardStripes(width, speed, rt_move(colors));
+    return new RtStripes(width, speed, rt_move(colors), true);  // hard_edge=true
   }
 
   // --- Named colors (no template args) ----------------------------
