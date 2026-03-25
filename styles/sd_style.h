@@ -316,8 +316,8 @@ public:
   }
   RGBA_um getColor(int led) override {
     RGBA_um ret = base_.node_->getColor(led);
+    // Add spark color near wipe tip if blade is on
     if (on_) {
-      // Blend spark color near the wipe tip (4 LEDs ahead of the front)
       int sm = rt_clamp(thres - 1024 - led * 256, 0, 255);
       if (sm < 255) {
         RGBA_um s = spark_color_.node_->getColor(led);
@@ -327,7 +327,7 @@ public:
                       (uint16_t)(((uint32_t)s.alpha * (32768 - smx) + (uint32_t)ret.alpha * smx) >> 15));
       }
     }
-    // Wipe: blend off_color below the threshold
+    // Blend off_color below the wipe threshold (shows retracted color)
     int bm = rt_clamp(thres - led * 256, 0, 255);
     if (bm < 255) {
       RGBA_um o = off_color_.node_->getColor(led);
