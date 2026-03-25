@@ -135,6 +135,12 @@ public:
   virtual ~RtColorNode() = default;
   virtual void run(BladeBase* blade) = 0;
   virtual RGBA_um getColor(int led) = 0;
+
+  // Power control: Returns whether blade can power off.
+  // Default: return true (can power off, this style doesn't need constant power)
+  // Effects: return false while active, true when complete
+  // This allows time-limited effects (clash, blast, etc.) to signal when they're done.
+  virtual bool canPowerOff() { return true; }
 };
 
 class RtFuncNode {
@@ -142,6 +148,11 @@ public:
   virtual ~RtFuncNode() = default;
   virtual void run(BladeBase* blade) = 0;
   virtual int getInteger(int led) = 0;
+
+  // Power control: Returns whether blade can power off.
+  // Default: return true (can power off, this function doesn't control power)
+  // Effects with fade-out: return based on fade magnitude
+  virtual bool canPowerOff() { return true; }
 };
 
 // Paint 'over' on top of 'base': equivalent to RGBA_um << RGBA_um from color.h.
@@ -220,6 +231,12 @@ public:
     }
     return Base::getColor(led);
   }
+  // Power control: Can power off if both color and alpha function can
+  bool canPowerOff() override {
+    bool color_ok = color_.node_ ? color_.node_->canPowerOff() : true;
+    bool alpha_ok = alpha_.node_ ? alpha_.node_->canPowerOff() : true;
+    return color_ok && alpha_ok;
+  }
 private:
   BladeBase* blade_;
 };
@@ -232,6 +249,12 @@ public:
   void run(BladeBase* blade) override { base_->run(blade); layer_->run(blade); }
   RGBA_um getColor(int led) override __attribute__((always_inline)) {
     return rt_compose(base_->getColor(led), layer_->getColor(led));
+  }
+  // Power control: Can power off only if both base and layer can power off
+  bool canPowerOff() override {
+    bool base_ok = base_ ? base_->canPowerOff() : true;
+    bool layer_ok = layer_ ? layer_->canPowerOff() : true;
+    return base_ok && layer_ok;
   }
 private:
   RtColorNode* base_;
@@ -254,6 +277,13 @@ public:
       mix >= 16384 ? b.overdrive : a.overdrive,
       (uint16_t)(((uint32_t)a.alpha * am + (uint32_t)b.alpha * (uint16_t)mix + 0x7fff) >> 15)
     );
+  }
+  // Power control: Can power off if all components can power off
+  bool canPowerOff() override {
+    bool f_ok = f_ ? f_->canPowerOff() : true;
+    bool a_ok = a_ ? a_->canPowerOff() : true;
+    bool b_ok = b_ ? b_->canPowerOff() : true;
+    return f_ok && a_ok && b_ok;
   }
 private:
   RtFuncNode* f_;
@@ -1403,7 +1433,11 @@ public:
       else
         blade->set(i, out);
     }
-    if (all_zero) blade->allow_disable();
+    // Power control: Check both color output and canPowerOff() signal
+    // Blade can power off when: all LEDs are dark AND style says it can power off
+    if (all_zero && root_->canPowerOff()) {
+      blade->allow_disable();
+    }
   }
 
   bool IsHandled(HandledFeature) override { return false; }
