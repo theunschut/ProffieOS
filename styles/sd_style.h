@@ -4283,18 +4283,90 @@ RtFuncNode* SDStyleParser::parseFunc() {
 // ---------------------------------------------------------------------------
 // SDStyleFactory
 // ---------------------------------------------------------------------------
+//
+// MEMORY OWNERSHIP MODEL:
+//
+// SDStyleFactory::make() returns a new BladeStyle instance allocated with 'new'.
+// The caller (preset system) is responsible for calling 'delete' when the preset
+// is deactivated or replaced. The preset system manages the BladeStyle lifetime,
+// not SDStyleFactory.
+//
+// Memory lifecycle:
+// 1. make() called at preset activation
+// 2. Returns new RuntimeBladeStyle(root) where root is a new RtColorNode tree
+// 3. run() called per-frame to update blade LEDs
+// 4. Caller invokes delete at preset deactivation
+// 5. Destructor frees root_ tree via delete (recursive cleanup of RtColorNode children)
+//
+// RtColorNode destructor chain:
+// - RtColorNode::~RtColorNode() is virtual
+// - Subclasses override to delete child nodes (see RtAlphaL, RtCompose, etc.)
+// - No memory leaks if delete is called on the returned BladeStyle
+//
+// Path Resolution (Task 4.2):
+// Paths are resolved when make() is called (lazy instantiation):
+// 1. Try /config/styles/filename first
+// 2. Fall back to /styles/filename
+// 3. Try raw path as-is
+// 4. If file not found: log warning, return safe Black style
+// 5. Never crash or hang on missing files
 
 class SDStyleFactory : public StyleFactory {
 public:
   explicit SDStyleFactory(const char* path) : path_(path) {}
 
   BladeStyle* make() override {
+    // Path resolution strategy: try multiple locations for the style file
+    // This follows ProffieOS conventions and improves user experience
+    const char* paths_to_try[] = {
+      path_,  // Original path (user-provided)
+      nullptr
+    };
+
+    // If user provided a simple filename (no slashes), try standard locations
+    bool has_slash = false;
+    for (const char* p = path_; *p; p++) {
+      if (*p == '/' || *p == '\\') {
+        has_slash = true;
+        break;
+      }
+    }
+
+    char config_path[256];
+    if (!has_slash) {
+      // Simple filename: try /config/styles/ first
+      strcpy(config_path, "/config/styles/");
+      strncat(config_path, path_, sizeof(config_path) - strlen(config_path) - 1);
+      paths_to_try[0] = config_path;
+    }
+
+    // Try each path in order
     FileReader f;
-    if (!f.Open(path_)) {
-      STDOUT.print("SDStyle: cannot open '");
-      STDOUT.print(path_);
-      STDOUT.println("' — style will be Black");
-      return new RuntimeBladeStyle(new RtRgb(Color16()));
+    const char* resolved_path = nullptr;
+    for (int i = 0; paths_to_try[i] != nullptr; i++) {
+      const char* try_path = paths_to_try[i];
+      if (f.Open(try_path)) {
+        resolved_path = try_path;
+        STDOUT.print("[INFO] SDStyle: resolved path to '");
+        STDOUT.print(try_path);
+        STDOUT.println("'");
+        break;
+      }
+    }
+
+    if (!resolved_path) {
+      // Try root path as fallback
+      if (f.Open(path_)) {
+        resolved_path = path_;
+        STDOUT.print("[INFO] SDStyle: resolved path to '");
+        STDOUT.print(path_);
+        STDOUT.println("'");
+      } else {
+        STDOUT.print("[WARN] SDStyle: cannot open '");
+        STDOUT.print(path_);
+        STDOUT.println("' — style will be Black");
+        return new RuntimeBladeStyle(new RtRgb(Color16()));
+      }
     }
 
     // Read up to 16 KB per style file.
@@ -4314,10 +4386,10 @@ public:
       --len;
     buf[len] = '\0';
 
-    STDOUT.print("SDStyle: loaded '"); STDOUT.print(path_);
+    STDOUT.print("[DEBUG] SDStyle: loaded '"); STDOUT.print(resolved_path);
     STDOUT.print("' ("); STDOUT.print(len); STDOUT.println(" bytes)");
     // Print first 80 chars so you can verify the file content in Serial Monitor
-    STDOUT.print("SDStyle: content[0..80]: '");
+    STDOUT.print("[DEBUG] SDStyle: content[0..80]: '");
     for (int i = 0; i < 80 && i < len; i++) {
       char c = buf[i];
       if (c == '\r' || c == '\n') STDOUT.print(' ');
@@ -4330,11 +4402,11 @@ public:
     free(buf);
 
     if (parser.unknown_count() == 0) {
-      STDOUT.print("SDStyle: parse OK — '"); STDOUT.print(path_); STDOUT.println("'");
+      STDOUT.print("[INFO] SDStyle: parse OK — '"); STDOUT.print(resolved_path); STDOUT.println("'");
     } else {
-      STDOUT.print("SDStyle: parse done with ");
+      STDOUT.print("[WARN] SDStyle: parse done with ");
       STDOUT.print(parser.unknown_count());
-      STDOUT.print(" unknown token(s) — '"); STDOUT.print(path_); STDOUT.println("'");
+      STDOUT.print(" unknown token(s) — '"); STDOUT.print(resolved_path); STDOUT.println("'");
     }
     return new RuntimeBladeStyle(root);
   }

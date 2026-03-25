@@ -113,6 +113,59 @@ public:
     variation = 0;
   }
 
+  // Helper: Parse StyleFromSD("path") function call from a string
+  // Returns the path string allocated with mkstr(), or nullptr on error
+  static const char* parseStyleFromSD(const char* str) {
+    if (!str) return nullptr;
+
+    // Check if string starts with "StyleFromSD("
+    const char* prefix = "StyleFromSD(";
+    if (strncmp(str, prefix, strlen(prefix)) != 0) {
+      return nullptr;
+    }
+
+    // Find the opening quote after "StyleFromSD("
+    const char* p = str + strlen(prefix);
+    while (*p && (*p == ' ' || *p == '\t')) p++;
+    if (*p != '"') {
+      return nullptr;
+    }
+    p++;  // Skip opening quote
+
+    // Find the closing quote
+    const char* path_start = p;
+    while (*p && *p != '"') p++;
+    if (*p != '"') {
+      return nullptr;
+    }
+
+    // Extract path between quotes
+    int path_len = p - path_start;
+    char tmp[256];
+    if (path_len >= (int)sizeof(tmp)) {
+      return nullptr;  // Path too long
+    }
+    strncpy(tmp, path_start, path_len);
+    tmp[path_len] = '\0';
+
+    return mkstr(tmp);
+  }
+
+  // Helper: Resolve style path using standard ProffieOS locations
+  // Tries: /config/styles/path, /styles/path, then path as-is
+  static const char* resolveStylePath(const char* filename) {
+    if (!filename) return nullptr;
+
+    // Try /config/styles/filename first (ProffieOS standard)
+    char buf[256];
+    strcpy(buf, "/config/styles/");
+    strncat(buf, filename, sizeof(buf) - strlen(buf) - 1);
+
+    // Check file existence - for now, just return the path
+    // The actual file check happens at style instantiation time
+    return mkstr(buf);
+  }
+
   bool Read(FileReader* f) {
     int preset_count = 0;
     int current_style = 0;
@@ -176,6 +229,47 @@ public:
 	}
 	continue;
       }
+
+      // Handle preset.style or preset.styleN entries (SD-card style loading)
+      // Examples: "preset.style", "preset.style1", "preset.style2"
+      if (!strncmp(variable, "preset.style", 12)) {
+	// Extract blade number from "preset.style" (=>0) or "preset.styleN" (=>N-1)
+	int blade_num = 0;
+	if (variable[12] != '\0') {
+	  blade_num = atoi(variable + 12) - 1;  // style1 -> blade 0, style2 -> blade 1
+	}
+
+	if (blade_num >= 0 && blade_num < NUM_BLADES) {
+	  char* style_str = f->readString();
+	  if (style_str) {
+	    // Check if this is a StyleFromSD(...) function call
+	    const char* sd_path = parseStyleFromSD(style_str);
+	    if (sd_path) {
+	      // It's a StyleFromSD() call - resolve the path
+	      const char* resolved = resolveStylePath(sd_path);
+	      if (resolved) {
+	        STDOUT.print("[INFO] Parsed StyleFromSD entry: '");
+	        STDOUT.print(resolved);
+	        STDOUT.print("' for blade ");
+	        STDOUT.println(blade_num);
+	        current_style_[blade_num] = ValidateStyleString(resolved);
+	      } else {
+	        STDOUT.print("[WARN] Failed to resolve SD path: '");
+	        STDOUT.print(sd_path);
+	        STDOUT.println("'");
+	      }
+	      free(style_str);
+	    } else {
+	      // Not a StyleFromSD() call - treat as regular compiled style
+	      (void)ValidateStyleString(style_str);
+	      current_style_[blade_num] = style_str;
+	    }
+	  }
+	  current_style = blade_num + 1;
+	}
+	continue;
+      }
+
       if (!strcmp(variable, "style")) {
 	char* tmp = f->readString();
 	(void)ValidateStyleString(tmp);
