@@ -198,13 +198,30 @@ private:
 // RGBA_um::operator*(uint16_t) only scales the alpha channel (unmultiplied semantics), so
 // AlphaL::getColor(led) = color_.getColor(led) * alpha is exactly equivalent to our hand-written version.
 // AlphaL::run() calls RunLayer/RunFunction which both gracefully return UNKNOWN for void run().
+//
+// FIX: Check blade state to prevent pre-ignited colors.
+// If blade is off (!blade->is_on()), return transparent color (alpha=0).
 class RtAlphaL : public RtColorNode, public AlphaL<RtColorAdapter, RtFuncAdapter> {
   using Base = AlphaL<RtColorAdapter, RtFuncAdapter>;
 public:
-  RtAlphaL(RtColorNode* color, RtFuncNode* alpha) { color_.node_ = color; alpha_.node_ = alpha; }
+  RtAlphaL(RtColorNode* color, RtFuncNode* alpha) : blade_(nullptr) {
+    color_.node_ = color;
+    alpha_.node_ = alpha;
+  }
   ~RtAlphaL() override { delete color_.node_; delete alpha_.node_; }
-  void run(BladeBase* blade) override { Base::run(blade); }
-  RGBA_um getColor(int led) override { return Base::getColor(led); }
+  void run(BladeBase* blade) override {
+    blade_ = blade;  // Store blade pointer for getColor() to check state
+    Base::run(blade);
+  }
+  RGBA_um getColor(int led) override {
+    // If blade is off, return fully transparent (ignore color and alpha)
+    if (blade_ && !blade_->is_on()) {
+      return RGBA_um::Transparent();
+    }
+    return Base::getColor(led);
+  }
+private:
+  BladeBase* blade_;
 };
 
 // Compose: paint layer on top of base  (Layers<> expands to nested RtCompose)
