@@ -3064,6 +3064,9 @@ public:
 
   BladeStyle* make() override {
     // 1. Open file — SD card access deferred to here (lazy loading per API-03)
+    // NOTE: path_ must be absolute (e.g., "/styles/foo.style").
+    // Soundfont-relative path resolution is handled in Phase 2 (INTEG-01/INTEG-02)
+    // where CurrentPreset provides the font directory context.
     LSFS::LSFILE file = LSFS::Open(path_);
     if (!file) {
       ProffieOSErrors::font_directory_not_found();
@@ -3356,13 +3359,22 @@ static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
     STDERR << "StyleFromSD: max recursion depth exceeded\n";
     return nullptr;
   }
+  // Handle #RRGGBB hex color literals (PARSE-03)
+  if (tok.current() == TOK_HEX) {
+    uint32_t hex = tok.hexValue();
+    uint8_t r = (hex >> 16) & 0xFF;
+    uint8_t g = (hex >> 8) & 0xFF;
+    uint8_t b = hex & 0xFF;
+    RGBA_um color = makeRGBA(r, g, b);
+    tok.next();
+    return new RtNamedColor(color);
+  }
   if (tok.current() != TOK_IDENT) {
     STDERR << "StyleFromSD: expected identifier for color node\n";
     return nullptr;
   }
   const char* name = tok.identifier();
 
-  // Check hex color literal inline? (hex is handled in parseFuncNode as int)
   // Named color check (no <> args)
   NamedColorResult nc = lookupNamedColor(name);
   if (nc.found) {
