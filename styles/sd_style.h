@@ -258,10 +258,55 @@ static int lookupEnumConstant(const char* name) {
   if (!strcmp(name, "EFFECT_LOCKUP_END"))             return (int)EFFECT_LOCKUP_END;
   if (!strcmp(name, "EFFECT_DRAG_BEGIN"))             return (int)EFFECT_DRAG_BEGIN;
   if (!strcmp(name, "EFFECT_DRAG_END"))               return (int)EFFECT_DRAG_END;
+  if (!strcmp(name, "EFFECT_PREON"))                  return (int)EFFECT_PREON;
+  if (!strcmp(name, "EFFECT_POSTOFF"))                return (int)EFFECT_POSTOFF;
   // EFFECT_MELT_BEGIN not defined in this codebase (no such effect)
   // EFFECT_MELT_END not defined in this codebase (no such effect)
   if (!strcmp(name, "EFFECT_COLOR_CHANGE"))           return (int)EFFECT_CHANGE;
   if (!strcmp(name, "EFFECT_TRACK"))                  return (int)EFFECT_TRACK;
+  if (!strcmp(name, "EFFECT_POWERSAVE"))              return (int)EFFECT_POWERSAVE;
+  if (!strcmp(name, "EFFECT_BATTERY_LEVEL"))          return (int)EFFECT_BATTERY_LEVEL;
+  if (!strcmp(name, "EFFECT_ALT_SOUND"))              return (int)EFFECT_ALT_SOUND;
+  if (!strcmp(name, "EFFECT_FAST_ON"))                return (int)EFFECT_FAST_ON;
+  if (!strcmp(name, "EFFECT_FAST_OFF"))               return (int)EFFECT_FAST_OFF;
+  if (!strcmp(name, "EFFECT_USER1"))                  return (int)EFFECT_USER1;
+  if (!strcmp(name, "EFFECT_USER2"))                  return (int)EFFECT_USER2;
+  if (!strcmp(name, "EFFECT_USER3"))                  return (int)EFFECT_USER3;
+  if (!strcmp(name, "EFFECT_USER4"))                  return (int)EFFECT_USER4;
+  if (!strcmp(name, "EFFECT_USER5"))                  return (int)EFFECT_USER5;
+  if (!strcmp(name, "EFFECT_USER6"))                  return (int)EFFECT_USER6;
+  if (!strcmp(name, "EFFECT_USER7"))                  return (int)EFFECT_USER7;
+  if (!strcmp(name, "EFFECT_USER8"))                  return (int)EFFECT_USER8;
+  if (!strcmp(name, "EFFECT_TRANSITION_SOUND"))       return (int)EFFECT_TRANSITION_SOUND;
+
+  // Style arg constants (used with RgbArg<> and IntArg<>)
+  if (!strcmp(name, "BASE_COLOR_ARG"))                return (int)BASE_COLOR_ARG;
+  if (!strcmp(name, "ALT_COLOR_ARG"))                 return (int)ALT_COLOR_ARG;
+  if (!strcmp(name, "ALT_COLOR2_ARG"))                return (int)ALT_COLOR2_ARG;
+  if (!strcmp(name, "ALT_COLOR3_ARG"))                return (int)ALT_COLOR3_ARG;
+  if (!strcmp(name, "STYLE_OPTION_ARG"))              return (int)STYLE_OPTION_ARG;
+  if (!strcmp(name, "STYLE_OPTION2_ARG"))             return (int)STYLE_OPTION2_ARG;
+  if (!strcmp(name, "STYLE_OPTION3_ARG"))             return (int)STYLE_OPTION3_ARG;
+  if (!strcmp(name, "IGNITION_COLOR_ARG"))            return (int)IGNITION_COLOR_ARG;
+  if (!strcmp(name, "IGNITION_OPTION_ARG"))           return (int)IGNITION_OPTION_ARG;
+  if (!strcmp(name, "IGNITION_OPTION2_ARG"))          return (int)IGNITION_OPTION2_ARG;
+  if (!strcmp(name, "IGNITION_TIME_ARG"))             return (int)IGNITION_TIME_ARG;
+  if (!strcmp(name, "BLAST_COLOR_ARG"))               return (int)BLAST_COLOR_ARG;
+  if (!strcmp(name, "CLASH_COLOR_ARG"))               return (int)CLASH_COLOR_ARG;
+  if (!strcmp(name, "LOCKUP_COLOR_ARG"))              return (int)LOCKUP_COLOR_ARG;
+  if (!strcmp(name, "LOCKUP_POSITION_ARG"))           return (int)LOCKUP_POSITION_ARG;
+  if (!strcmp(name, "LB_COLOR_ARG"))                  return (int)LB_COLOR_ARG;
+  if (!strcmp(name, "DRAG_COLOR_ARG"))                return (int)DRAG_COLOR_ARG;
+  if (!strcmp(name, "DRAG_SIZE_ARG"))                 return (int)DRAG_SIZE_ARG;
+  if (!strcmp(name, "STAB_COLOR_ARG"))                return (int)STAB_COLOR_ARG;
+  if (!strcmp(name, "MELT_SIZE_ARG"))                 return (int)MELT_SIZE_ARG;
+  if (!strcmp(name, "RETRACTION_COLOR_ARG"))          return (int)RETRACTION_COLOR_ARG;
+  if (!strcmp(name, "RETRACTION_OPTION_ARG"))         return (int)RETRACTION_OPTION_ARG;
+  if (!strcmp(name, "RETRACTION_OPTION2_ARG"))        return (int)RETRACTION_OPTION2_ARG;
+  if (!strcmp(name, "RETRACTION_TIME_ARG"))           return (int)RETRACTION_TIME_ARG;
+  if (!strcmp(name, "PREON_COLOR_ARG"))               return (int)PREON_COLOR_ARG;
+  if (!strcmp(name, "PREON_SIZE_ARG"))                return (int)PREON_SIZE_ARG;
+  if (!strcmp(name, "PREON_OPTION_ARG"))              return (int)PREON_OPTION_ARG;
 
   // SaberBase::LOCKUP_* values (also accepted without prefix)
   if (!strcmp(name, "LOCKUP_NORMAL") ||
@@ -900,6 +945,19 @@ private:
   RandomPerLEDF impl_;
 };
 
+// RandomF wrapper (same value all LEDs, uniform random per frame)
+class RtRandomFNode : public RtFuncNode {
+public:
+  RtRandomFNode() : value_(0) {}
+  FunctionRunResult run(BladeBase* /*blade*/) override {
+    value_ = random(32768);
+    return FunctionRunResult::UNKNOWN;
+  }
+  int getInteger(int /*led*/) override { return value_; }
+private:
+  int value_;
+};
+
 // --- HumpFlicker<A, B, HUMP_WIDTH> = Layers<A, AlphaL<B, HumpFlickerF<HUMP_WIDTH>>> ---
 // Runtime: RtLayers(A, RtAlphaL(B, RtHumpFlickerFImpl(HUMP_WIDTH)))
 // Ownership: func_ owned by alpha (via RtAlphaL); alpha owned by layers_; a owned by layers_.
@@ -980,6 +1038,59 @@ public:
   RtBrownNoiseFlickerL(RtColorNode* b, int grade)
     : func_(new RtBrownNoiseFNode(grade * 128)), node_(new RtAlphaL(b, func_)) {}
   ~RtBrownNoiseFlickerL() override { delete node_; }
+  bool run(BladeBase* blade) override { return node_->run(blade); }
+  RGBA_um getColor(int led) override { return node_->getColor(led); }
+private:
+  RtFuncNode* func_;
+  RtAlphaL* node_;
+};
+
+// --- RandomFlicker<A, B> = Layers<A, AlphaL<B, RandomF>> (same value all LEDs) ---
+class RtRandomFlicker : public RtColorNode {
+public:
+  RtRandomFlicker(RtColorNode* a, RtColorNode* b) : layers_(nullptr) {
+    RtColorNode* alpha = new RtAlphaL(b, new RtRandomFNode());
+    RtColorNode* children[2] = {a, alpha};
+    layers_ = new RtLayers(children, 2);
+  }
+  ~RtRandomFlicker() override { delete layers_; }
+  bool run(BladeBase* blade) override { return layers_->run(blade); }
+  RGBA_um getColor(int led) override { return layers_->getColor(led); }
+private:
+  RtLayers* layers_;
+};
+
+// --- BlinkingL<B, MILLIS_FUNC, PROMILLE_FUNC>
+// = AlphaL<B, BlinkingF<MILLIS_FUNC, PROMILLE_FUNC>>
+// BlinkingF returns 32768 for the "on" portion of the blink cycle, 0 otherwise.
+class RtBlinkingFNode : public RtFuncNode {
+public:
+  RtBlinkingFNode(RtFuncNode* millis, RtFuncNode* promille)
+    : millis_(millis), promille_(promille), value_(0) {}
+  ~RtBlinkingFNode() override { delete millis_; delete promille_; }
+  FunctionRunResult run(BladeBase* blade) override {
+    int ms = millis_->getInteger(0);
+    int pm = promille_->getInteger(0);
+    if (ms <= 0) ms = 500;
+    // compute where we are in the cycle
+    uint32_t t = millis() % (uint32_t)ms;
+    // on for the first (pm/1000) fraction of the cycle
+    int on_ms = (ms * pm) / 1000;
+    value_ = (t < (uint32_t)on_ms) ? 32768 : 0;
+    return FunctionRunResult::UNKNOWN;
+  }
+  int getInteger(int /*led*/) override { return value_; }
+private:
+  RtFuncNode* millis_;
+  RtFuncNode* promille_;
+  int value_;
+};
+
+class RtBlinkingL : public RtColorNode {
+public:
+  RtBlinkingL(RtColorNode* b, RtFuncNode* millis, RtFuncNode* promille)
+    : func_(new RtBlinkingFNode(millis, promille)), node_(new RtAlphaL(b, func_)) {}
+  ~RtBlinkingL() override { delete node_; }
   bool run(BladeBase* blade) override { return node_->run(blade); }
   RGBA_um getColor(int led) override { return node_->getColor(led); }
 private:
@@ -3025,6 +3136,8 @@ static RtColorNode* makeBrownNoiseFlicker(Tokenizer& tok, int depth);
 static RtColorNode* makeBrownNoiseFlickerL(Tokenizer& tok, int depth);
 static RtColorNode* makeRandomPerLEDFlicker(Tokenizer& tok, int depth);
 static RtColorNode* makeRandomPerLEDFlickerL(Tokenizer& tok, int depth);
+static RtColorNode* makeBlinkingL(Tokenizer& tok, int depth);
+static RtColorNode* makeRandomFlicker(Tokenizer& tok, int depth);
 static RtColorNode* makeStripes(Tokenizer& tok, int depth);
 static RtColorNode* makeStripesX(Tokenizer& tok, int depth);
 static RtColorNode* makePulsing(Tokenizer& tok, int depth);
@@ -3137,6 +3250,8 @@ static const StyleDispatch style_dispatch[] = {
   {"BrownNoiseFlickerL",       makeBrownNoiseFlickerL,      nullptr,                nullptr        },
   {"RandomPerLEDFlicker",      makeRandomPerLEDFlicker,     nullptr,                nullptr        },
   {"RandomPerLEDFlickerL",     makeRandomPerLEDFlickerL,    nullptr,                nullptr        },
+  {"BlinkingL",                makeBlinkingL,               nullptr,                nullptr        },
+  {"RandomFlicker",            makeRandomFlicker,           nullptr,                nullptr        },
   {"Stripes",                  makeStripes,                 nullptr,                nullptr        },
   {"StripesX",                 makeStripesX,                nullptr,                nullptr        },
   {"Pulsing",                  makePulsing,                 nullptr,                nullptr        },
@@ -3645,6 +3760,30 @@ static RtColorNode* makeRandomPerLEDFlickerL(Tokenizer& tok, int depth) {
   RtColorNode* b = parseColorNode(tok, depth); if (!b) return nullptr;
   if (!expectClose(tok)) { delete b; return nullptr; }
   return new RtRandomPerLEDFlickerL(b);
+}
+
+// RandomFlicker<A, B> = Layers<A, AlphaL<B, RandomF>>
+static RtColorNode* makeRandomFlicker(Tokenizer& tok, int depth) {
+  if (!expectOpen(tok)) return nullptr;
+  RtColorNode* a = parseColorNode(tok, depth); if (!a) return nullptr;
+  if (!expectComma(tok)) { delete a; return nullptr; }
+  RtColorNode* b = parseColorNode(tok, depth); if (!b) { delete a; return nullptr; }
+  if (!expectClose(tok)) { delete a; delete b; return nullptr; }
+  return new RtRandomFlicker(a, b);
+}
+
+// BlinkingL<B, MILLIS_FUNC, PROMILLE_FUNC>
+static RtColorNode* makeBlinkingL(Tokenizer& tok, int depth) {
+  if (!expectOpen(tok)) return nullptr;
+  RtColorNode* b = parseColorNode(tok, depth); if (!b) return nullptr;
+  if (!expectComma(tok)) { delete b; return nullptr; }
+  RtFuncNode* millis = parseFuncNode(tok, depth);
+  if (!millis) { delete b; return nullptr; }
+  if (!expectComma(tok)) { delete b; delete millis; return nullptr; }
+  RtFuncNode* promille = parseFuncNode(tok, depth);
+  if (!promille) { delete b; delete millis; return nullptr; }
+  if (!expectClose(tok)) { delete b; delete millis; delete promille; return nullptr; }
+  return new RtBlinkingL(b, millis, promille);
 }
 
 // Stripes<WIDTH_INT, SPEED_INT, COLOR...>
