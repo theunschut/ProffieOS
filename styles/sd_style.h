@@ -402,7 +402,7 @@ static NamedColorResult lookupNamedColor(const char* name) {
       return {true, makeRGBA(table[i].r, table[i].g, table[i].b)};
     }
   }
-  return {false, RGBA_um()};
+  return {false, RGBA_um::Transparent()};
 }
 
 // ============================================================
@@ -473,7 +473,7 @@ public:
   }
 
   RGBA_um getColor(int led) override {
-    if (count_ == 0) return RGBA_um();
+    if (count_ == 0) return RGBA_um::Transparent();
     // Start with base color
     RGBA_um result = children_[0]->getColor(led);
     // Compose layers on top via << operator
