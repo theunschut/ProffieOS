@@ -316,6 +316,10 @@ A runtime SD card style loader for ProffieOS that enables lightsaber blade light
 <!-- GSD:architecture-end -->
 
 <!-- GSD:workflow-start source:GSD defaults -->
+## Git Rules
+
+**Never commit `.planning/` to git.** The `.planning/` directory is gitignored and must stay that way. It contains planning artifacts (STATE.md, ROADMAP.md, REQUIREMENTS.md, SUMMARYs) that are local-only. Do not use `git add --force` or `git add -f` on any `.planning/` file. If a gsd-tools commit command tries to include `.planning/` files in a code branch, skip those files.
+
 ## GSD Workflow Enforcement
 
 Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
