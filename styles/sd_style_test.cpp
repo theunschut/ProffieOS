@@ -540,9 +540,9 @@ void test_parse_rgb() {
   on_ = true;
   node->run(&mb);
   RGBA_um c = node->getColor(0);
-  CHECK(c.r > 0);
-  CHECK_EQ(c.g, 0);
-  CHECK_EQ(c.b, 0);
+  CHECK(c.c.r > 0);
+  CHECK_EQ(c.c.g, 0);
+  CHECK_EQ(c.c.b, 0);
   delete node;
   fprintf(stderr, "  test_parse_rgb PASSED\n");
 }
@@ -555,10 +555,47 @@ void test_parse_hex_color_blue() {
   mb.colors.resize(1);
   node->run(&mb);
   RGBA_um c = node->getColor(0);
-  CHECK_EQ(c.r, 0);
-  CHECK(c.b > 0);
+  CHECK_EQ(c.c.r, 0);
+  CHECK(c.c.b > 0);
   delete node;
   fprintf(stderr, "  test_parse_hex_color_blue PASSED\n");
+}
+
+void test_parse_hex_color_literal() {
+  // Test: #FF0000 parses to a color node that returns red
+  RtColorNode* node = parseInline("#FF0000");
+  CHECK(node != nullptr);
+  MockBlade mb;
+  mb.colors.resize(1);
+  node->run(&mb);
+  RGBA_um c = node->getColor(0);
+  // Color8(255,0,0) -> Color16 scales to 16-bit: r should be ~65535, g=0, b=0
+  CHECK(c.c.r > 60000);
+  CHECK_EQ(c.c.g, 0);
+  CHECK_EQ(c.c.b, 0);
+  delete node;
+
+  // Test: #00FF00 parses to green
+  node = parseInline("#00FF00");
+  CHECK(node != nullptr);
+  node->run(&mb);
+  c = node->getColor(0);
+  CHECK_EQ(c.c.r, 0);
+  CHECK(c.c.g > 60000);
+  CHECK_EQ(c.c.b, 0);
+  delete node;
+
+  // Test: #0000FF parses to blue
+  node = parseInline("#0000FF");
+  CHECK(node != nullptr);
+  node->run(&mb);
+  c = node->getColor(0);
+  CHECK_EQ(c.c.r, 0);
+  CHECK_EQ(c.c.g, 0);
+  CHECK(c.c.b > 60000);
+  delete node;
+
+  fprintf(stderr, "  test_parse_hex_color_literal PASSED\n");
 }
 
 void test_parse_named_colors() {
@@ -904,6 +941,7 @@ int main() {
   fprintf(stderr, "\n=== Color Type Tests ===\n");
   test_parse_rgb();
   test_parse_hex_color_blue();
+  test_parse_hex_color_literal();
   test_parse_named_colors();
   test_parse_rgb16();
 
