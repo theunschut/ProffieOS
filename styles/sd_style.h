@@ -3074,8 +3074,8 @@ public:
       return nullptr;
     }
 
-    // 2. Read entire file into buffer (style files are small, <4KB)
-    char buf[4096];
+    // 2. Read entire file into buffer (style files can reach ~5KB for complex styles)
+    char buf[8192];
     int n = file.read((uint8_t*)buf, sizeof(buf) - 1);
     file.close();
     if (n <= 0) {
@@ -4236,6 +4236,8 @@ static RtColorNode* makeLocalizedClashL(Tokenizer& tok, int depth) {
   int size = 10000;
   int effect = (int)EFFECT_CLASH;
   if (tok.current() == TOK_COMMA) { tok.next(); size = parseIntArg(tok); }
+  // CLASH_WIDTH_PERCENT is the 3rd template arg — consume it but don't use it at runtime
+  if (tok.current() == TOK_COMMA) { tok.next(); parseIntArg(tok); }
   if (tok.current() == TOK_COMMA) { tok.next(); effect = parseIntArg(tok); }
   if (!expectClose(tok)) { delete c; return nullptr; }
   return new RtLocalizedClashL(c, size, effect);

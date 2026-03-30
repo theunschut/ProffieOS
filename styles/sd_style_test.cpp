@@ -749,7 +749,9 @@ void test_parse_torro_##name() {                                     \
   mb.colors.resize(144);                                             \
   on_ = true;                                                        \
   micros_ = 1000000;                                                 \
+  mb.SetStyle(bs);                                                   \
   bs->run(&mb);                                                      \
+  mb.UnSetStyle();                                                   \
   delete bs;                                                         \
   fprintf(stderr, "  test_parse_torro_" #name " PASSED\n");        \
 }
@@ -912,6 +914,124 @@ void test_parse_extra_comma() {
 }
 
 // ============================================================
+// Chimera Layer Isolation Tests
+// ============================================================
+
+void test_chimera_layer_isolation() {
+  fprintf(stderr, "  [chimera isolation] layer 1 (Mix SmoothStep)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "Mix<SmoothStep<Scale<HoldPeakF<SwingSpeed<1150>,Int<750>,Int<17500>>,HoldPeakF<IsGreaterThan<SwingSpeed<1150>,Int<30000>>,Int<31000>,Int<8000>>,Int<32768>>,Int<-15000>>,HumpFlicker<RotateColorsX<Variation,Rgb<135,35,210>>,RotateColorsX<Variation,Rgb<57,20,125>>,35>,BrownNoiseFlicker<Red,Rgb16<18927,0,0>,50>>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 1 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 2 (AlphaL BrownNoise)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "AlphaL<BrownNoiseFlicker<Red,Rgb16<18927,0,0>,50>,SmoothStep<Scale<SwingSpeed<7000>,HoldPeakF<IsGreaterThan<SwingSpeed<1150>,Int<30000>>,Int<30000>,Int<8000>>,Int<32768>>,Int<-10>>>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 2 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 3 (LockupTrL NORMAL)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "LockupTrL<AlphaMixL<Bump<Scale<BladeAngle<>,Scale<BladeAngle<0,16000>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-12000>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<10000>>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-10000>>>,Scale<SwingSpeed<100>,Int<14000>,Int<18000>>>,BrownNoiseFlickerL<RgbArg<LOCKUP_COLOR_ARG,White>,Int<200>>,StripesX<Int<1800>,Scale<NoisySoundLevel,Int<-3500>,Int<-5000>>,Mix<Int<6425>,Black,RgbArg<LOCKUP_COLOR_ARG,White>>,RgbArg<LOCKUP_COLOR_ARG,White>,Mix<Int<12850>,Black,RgbArg<LOCKUP_COLOR_ARG,White>>>>,TrConcat<TrExtend<50,TrInstant>,Mix<IsLessThan<ClashImpactF<>,Int<26000>>,RgbArg<LOCKUP_COLOR_ARG,White>,AlphaL<RgbArg<LOCKUP_COLOR_ARG,White>,Bump<Scale<BladeAngle<>,Scale<BladeAngle<0,16000>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-12000>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<10000>>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-10000>>>,Scale<ClashImpactF<>,Int<20000>,Int<60000>>>>>,TrExtend<3000,TrFade<300>>,AlphaL<AudioFlicker<RgbArg<LOCKUP_COLOR_ARG,White>,Mix<Int<10280>,Black,RgbArg<LOCKUP_COLOR_ARG,White>>>,Bump<Scale<BladeAngle<>,Scale<BladeAngle<0,16000>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-12000>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<10000>>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-10000>>>,Int<13000>>>,TrFade<3000>>,TrConcat<TrInstant,RgbArg<LOCKUP_COLOR_ARG,White>,TrFadeX<Percentage<WavLen<EFFECT_LOCKUP_END>,33>>>,SaberBase::LOCKUP_NORMAL>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 3 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 4 (ResponsiveLightningBlockL)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "ResponsiveLightningBlockL<Strobe<RgbArg<LB_COLOR_ARG,White>,AudioFlicker<RgbArg<LB_COLOR_ARG,White>,Blue>,50,1>,TrConcat<TrInstant,AlphaL<RgbArg<LB_COLOR_ARG,White>,Bump<Int<12000>,Int<18000>>>,TrFade<200>>,TrConcat<TrInstant,HumpFlickerL<AlphaL<RgbArg<LB_COLOR_ARG,White>,Int<16000>>,30>,TrSmoothFade<600>>>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 4 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 5 (ResponsiveStabL)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "ResponsiveStabL<AudioFlickerL<RgbArg<STAB_COLOR_ARG,Yellow>>,TrWipeInX<Percentage<WavLen<EFFECT_STAB>,50>>,TrFadeX<Percentage<WavLen<EFFECT_STAB>,50>>>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 5 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 6 (EffectSequence BLAST)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "EffectSequence<EFFECT_BLAST,ResponsiveBlastL<RgbArg<BLAST_COLOR_ARG,White>,Int<400>,Scale<SwingSpeed<200>,Int<100>,Int<400>>,Int<400>>,LocalizedClashL<RgbArg<BLAST_COLOR_ARG,White>,80,30,EFFECT_BLAST>,ResponsiveBlastWaveL<RgbArg<BLAST_COLOR_ARG,White>,Scale<SwingSpeed<400>,Int<500>,Int<200>>,Scale<SwingSpeed<400>,Int<100>,Int<400>>>>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 6 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 7 (Mix IsLessThan clash)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "Mix<IsLessThan<ClashImpactF<>,Int<26000>>,TransitionEffectL<TrConcat<TrInstant,AlphaL<RgbArg<CLASH_COLOR_ARG,White>,Bump<Scale<BladeAngle<>,Scale<BladeAngle<0,16000>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-12000>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<10000>>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-10000>>>,Scale<ClashImpactF<>,Int<12000>,Int<60000>>>>,TrFadeX<Scale<ClashImpactF<>,Int<200>,Int<400>>>>,EFFECT_CLASH>,TransitionEffectL<TrWaveX<RgbArg<CLASH_COLOR_ARG,White>,Scale<ClashImpactF<>,Int<100>,Int<400>>,Int<100>,Scale<ClashImpactF<>,Int<100>,Int<400>>,Scale<BladeAngle<>,Scale<BladeAngle<0,16000>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-12000>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<10000>>>,Sum<IntArg<LOCKUP_POSITION_ARG,16000>,Int<-10000>>>>,EFFECT_CLASH>>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 7 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 8 (LockupTrL DRAG)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "LockupTrL<AlphaL<TransitionEffect<RandomPerLEDFlickerL<RgbArg<DRAG_COLOR_ARG,White>>,BrownNoiseFlickerL<RgbArg<DRAG_COLOR_ARG,White>,Int<300>>,TrExtend<4000,TrInstant>,TrFade<4000>,EFFECT_DRAG_BEGIN>,SmoothStep<Scale<TwistAngle<>,IntArg<DRAG_SIZE_ARG,28000>,Int<30000>>,Int<3000>>>,TrWipeIn<200>,TrWipe<200>,SaberBase::LOCKUP_DRAG,Int<1>>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 8 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 9 (LockupTrL MELT)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "LockupTrL<AlphaL<Stripes<2000,4000,Mix<TwistAngle<>,RgbArg<STAB_COLOR_ARG,Yellow>,RotateColorsX<Int<3000>,RgbArg<STAB_COLOR_ARG,Yellow>>>,Mix<Sin<Int<50>>,Black,Mix<TwistAngle<>,RgbArg<STAB_COLOR_ARG,Yellow>,RotateColorsX<Int<3000>,RgbArg<STAB_COLOR_ARG,Yellow>>>>,Mix<Int<4096>,Black,Mix<TwistAngle<>,RgbArg<STAB_COLOR_ARG,Yellow>,RotateColorsX<Int<3000>,RgbArg<STAB_COLOR_ARG,Yellow>>>>>,SmoothStep<Scale<TwistAngle<>,IntArg<MELT_SIZE_ARG,28000>,Int<30000>>,Int<3000>>>,TrConcat<TrExtend<4000,TrWipeIn<200>>,AlphaL<HumpFlicker<Mix<TwistAngle<>,RgbArg<STAB_COLOR_ARG,Yellow>,RotateColorsX<Int<3000>,RgbArg<STAB_COLOR_ARG,Yellow>>>,RotateColorsX<Int<3000>,Mix<TwistAngle<>,RgbArg<STAB_COLOR_ARG,Yellow>,RotateColorsX<Int<3000>,RgbArg<STAB_COLOR_ARG,Yellow>>>>,100>,SmoothStep<Scale<TwistAngle<>,IntArg<MELT_SIZE_ARG,28000>,Int<30000>>,Int<3000>>>,TrFade<4000>>,TrWipe<200>,SaberBase::LOCKUP_MELT,Int<1>>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 9 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 10 (InOutTrL)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "InOutTrL<TrWipeSparkTip<White,300>,TrWipeInSparkTip<White,300>,Black>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 10 PASSED\n");
+  }
+
+  fprintf(stderr, "  [chimera isolation] layer 11 (TransitionEffectL PREON)...\n");
+  {
+    RtColorNode* n = parseInline(
+      "TransitionEffectL<TrConcat<TrInstant,AlphaL<BrownNoiseFlicker<Black,RotateColorsX<Variation,Rgb16<65535,58942,40982>>,150>,SmoothStep<Scale<NoisySoundLevel,Int<300>,Int<1700>>,Int<-11000>>>,TrDelayX<WavLen<EFFECT_PREON>>>,EFFECT_PREON>"
+    );
+    CHECK(n != nullptr);
+    delete n;
+    fprintf(stderr, "  [chimera isolation] layer 11 PASSED\n");
+  }
+
+  fprintf(stderr, "  test_chimera_layer_isolation PASSED\n");
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -962,6 +1082,9 @@ int main() {
   test_parse_rotate_colors_variation();
   test_parse_rgbarg();
   test_parse_intarg();
+
+  fprintf(stderr, "\n=== Chimera Layer Isolation Tests ===\n");
+  test_chimera_layer_isolation();
 
   fprintf(stderr, "\n=== Torro Config Style Tests ===\n");
   test_parse_torro_calkestis();
