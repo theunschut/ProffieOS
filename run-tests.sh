@@ -19,7 +19,7 @@ echo "=== Running test suites ==="
 # Mount repo as read-write volume at /proffie (WORKDIR in Dockerfile)
 # --rm removes container after run (clean up always)
 
-docker run --rm \
+MSYS_NO_PATHCONV=1 docker run --rm \
   -v "$SCRIPT_DIR:/proffie" \
   "$IMAGE_NAME" \
   bash -c '
