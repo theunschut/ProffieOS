@@ -3521,7 +3521,8 @@ static RtColorNode* makeAlphaL(Tokenizer& tok, int depth) {
   return new RtAlphaL(color, func);
 }
 
-// makeInOutTrL: InOutTrL<TRANS_out, TRANS_in, COLOR_off>
+// makeInOutTrL: InOutTrL<TRANS_out, TRANS_in [, COLOR_off]>
+// COLOR_off is optional; defaults to Black (matches template default Rgb<0,0,0>).
 static RtColorNode* makeInOutTrL(Tokenizer& tok, int depth) {
   if (!expectOpen(tok)) return nullptr;
 
@@ -3533,10 +3534,15 @@ static RtColorNode* makeInOutTrL(Tokenizer& tok, int depth) {
   RtTransNode* in_tr = parseTransNode(tok, depth);
   if (!in_tr) { delete out_tr; return nullptr; }
 
-  if (!expectComma(tok)) { delete out_tr; delete in_tr; return nullptr; }
-
-  RtColorNode* off = parseColorNode(tok, depth);
-  if (!off) { delete out_tr; delete in_tr; return nullptr; }
+  RtColorNode* off;
+  if (tok.current() == TOK_CLOSE) {
+    // No off-color arg — default to Black
+    off = new RtNamedColor(makeRGBA(0, 0, 0));
+  } else {
+    if (!expectComma(tok)) { delete out_tr; delete in_tr; return nullptr; }
+    off = parseColorNode(tok, depth);
+    if (!off) { delete out_tr; delete in_tr; return nullptr; }
+  }
 
   if (!expectClose(tok)) { delete out_tr; delete in_tr; delete off; return nullptr; }
 
@@ -3803,7 +3809,8 @@ static RtColorNode* makeStripes(Tokenizer& tok, int depth) {
   if (!expectOpen(tok)) return nullptr;
   int width = parseIntArg(tok); if (width < 0) return nullptr;
   if (!expectComma(tok)) return nullptr;
-  int speed = parseIntArg(tok); if (speed < 0) return nullptr;
+  // speed can be negative (controls scroll direction), so don't check sign
+  int speed = parseIntArg(tok);
   RtColorNode* colors[8];
   int ncolors = 0;
   while (tok.current() == TOK_COMMA && ncolors < 8) {
