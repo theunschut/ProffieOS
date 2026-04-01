@@ -506,6 +506,110 @@ void test_style_from_sd_missing_file() {
 // Plan 04: Comprehensive Factory Builder Tests
 // ============================================================
 
+// Helper: load .style file and extract style string (removes StylePtr<...>() wrapper)
+// Allocates buffer that must be freed by caller
+static char* loadStyleFileAndExtract(const char* file_path) {
+  // Read entire file into buffer
+  FILE* f = fopen(file_path, "r");
+  if (!f) return nullptr;
+
+  // Get file size
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+
+  if (size <= 0) {
+    fclose(f);
+    return nullptr;
+  }
+
+  char* buffer = (char*)malloc(size + 1);
+  if (!buffer) {
+    fclose(f);
+    return nullptr;
+  }
+
+  size_t read = fread(buffer, 1, size, f);
+  fclose(f);
+
+  if (read != (size_t)size) {
+    free(buffer);
+    return nullptr;
+  }
+
+  buffer[read] = '\0';
+
+  // Extract style string: remove "StylePtr<" prefix and ">()suffix" if present
+  // If no wrapper, just return the whole content
+  char* result = nullptr;
+
+  // Find "StylePtr<"
+  const char* start = strstr(buffer, "StylePtr<");
+  if (start) {
+    // Has wrapper - extract the wrapped content
+    start += 9;  // Skip past "StylePtr<"
+
+    // Find the LAST occurrence of ">()in the file (not the first)
+    // We search from the end backwards to find the closing >()
+    const char* end = buffer + read;  // end of buffer
+
+    // Search backwards from end for ">("
+    const char* end_marker = nullptr;
+    for (const char* p = end - 3; p >= start; p--) {
+      if (p[0] == '>' && p[1] == '(' && p[2] == ')') {
+        end_marker = p;
+        break;
+      }
+    }
+
+    if (!end_marker) {
+      free(buffer);
+      return nullptr;
+    }
+
+    // Calculate the length
+    int len = end_marker - start;
+    if (len <= 0) {
+      free(buffer);
+      return nullptr;
+    }
+
+    result = (char*)malloc(len + 1);
+    if (!result) {
+      free(buffer);
+      return nullptr;
+    }
+
+    strncpy(result, start, len);
+    result[len] = '\0';
+  } else {
+    // No wrapper - file contains raw style string
+    // Just return a copy of the entire file (trimming trailing whitespace)
+    int len = strlen(buffer);
+    // Trim trailing whitespace/newlines
+    while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r' || buffer[len - 1] == ' ' || buffer[len - 1] == '\t')) {
+      len--;
+    }
+
+    if (len <= 0) {
+      free(buffer);
+      return nullptr;
+    }
+
+    result = (char*)malloc(len + 1);
+    if (!result) {
+      free(buffer);
+      return nullptr;
+    }
+
+    strncpy(result, buffer, len);
+    result[len] = '\0';
+  }
+
+  free(buffer);
+  return result;
+}
+
 // Helper: write style to temp file, parse, return BladeStyle
 // Returns nullptr on parse failure. Caller must delete result.
 static BladeStyle* parseStyleFromFile(const char* path, const char* content) {
@@ -518,6 +622,29 @@ static BladeStyle* parseStyleFromFile(const char* path, const char* content) {
   BladeStyle* bs = factory->make();
   delete factory;
   unlink(path);
+  return bs;
+}
+
+// Helper: load .style file from config/styles/ directory, extract style string, and parse
+// Returns parsed BladeStyle or nullptr on failure
+static BladeStyle* loadAndParseStyleFromFile(const char* style_name) {
+  // Build path: ../config/styles/{style_name}.style (relative to styles/ directory)
+  char file_path[256];
+  snprintf(file_path, sizeof(file_path), "../config/styles/%s.style", style_name);
+
+  // Load and extract style string
+  char* style_str = loadStyleFileAndExtract(file_path);
+  if (!style_str) {
+    fprintf(stderr, "Failed to load style file: %s\n", file_path);
+    return nullptr;
+  }
+
+  // Write extracted style to a temporary file for parsing
+  char temp_path[256];
+  snprintf(temp_path, sizeof(temp_path), ".test_%s.style", style_name);
+  BladeStyle* bs = parseStyleFromFile(temp_path, style_str);
+
+  free(style_str);
   return bs;
 }
 
@@ -914,6 +1041,101 @@ void test_parse_extra_comma() {
 }
 
 // ============================================================
+// Production .Style File Tests (Real Data from config/styles/)
+// ============================================================
+
+void test_load_production_calkestis() {
+  fprintf(stderr, "  Loading production calkestis.style...\n");
+  BladeStyle* bs = loadAndParseStyleFromFile("calkestis");
+  CHECK(bs != nullptr);
+  MockBlade mb;
+  mb.colors.resize(144);
+  on_ = true;
+  micros_ = 1000000;  // 1 second — past ignition
+  bs->run(&mb);
+  delete bs;
+  fprintf(stderr, "  test_load_production_calkestis PASSED\n");
+}
+
+void test_load_production_chimera() {
+  fprintf(stderr, "  Loading production chimera.style...\n");
+  BladeStyle* bs = loadAndParseStyleFromFile("chimera");
+  CHECK(bs != nullptr);
+  MockBlade mb;
+  mb.colors.resize(144);
+  on_ = true;
+  micros_ = 1000000;  // 1 second — past ignition
+  bs->run(&mb);
+  delete bs;
+  fprintf(stderr, "  test_load_production_chimera PASSED\n");
+}
+
+void test_load_production_kyberradiance() {
+  fprintf(stderr, "  Loading production kyberradiance.style...\n");
+  BladeStyle* bs = loadAndParseStyleFromFile("kyberradiance");
+  CHECK(bs != nullptr);
+  MockBlade mb;
+  mb.colors.resize(144);
+  on_ = true;
+  micros_ = 1000000;  // 1 second — past ignition
+  bs->run(&mb);
+  delete bs;
+  fprintf(stderr, "  test_load_production_kyberradiance PASSED\n");
+}
+
+void test_load_production_mercenary() {
+  fprintf(stderr, "  Loading production mercenary.style...\n");
+  BladeStyle* bs = loadAndParseStyleFromFile("mercenary");
+  CHECK(bs != nullptr);
+  MockBlade mb;
+  mb.colors.resize(144);
+  on_ = true;
+  micros_ = 1000000;  // 1 second — past ignition
+  bs->run(&mb);
+  delete bs;
+  fprintf(stderr, "  test_load_production_mercenary PASSED\n");
+}
+
+void test_load_production_hati() {
+  fprintf(stderr, "  Loading production hati.style...\n");
+  BladeStyle* bs = loadAndParseStyleFromFile("hati");
+  CHECK(bs != nullptr);
+  MockBlade mb;
+  mb.colors.resize(144);
+  on_ = true;
+  micros_ = 1000000;  // 1 second — past ignition
+  bs->run(&mb);
+  delete bs;
+  fprintf(stderr, "  test_load_production_hati PASSED\n");
+}
+
+void test_load_production_crispity() {
+  fprintf(stderr, "  Loading production crispity.style...\n");
+  BladeStyle* bs = loadAndParseStyleFromFile("crispity");
+  CHECK(bs != nullptr);
+  MockBlade mb;
+  mb.colors.resize(144);
+  on_ = true;
+  micros_ = 1000000;  // 1 second — past ignition
+  bs->run(&mb);
+  delete bs;
+  fprintf(stderr, "  test_load_production_crispity PASSED\n");
+}
+
+void test_load_production_assassin() {
+  fprintf(stderr, "  Loading production assassin.style...\n");
+  BladeStyle* bs = loadAndParseStyleFromFile("assassin");
+  CHECK(bs != nullptr);
+  MockBlade mb;
+  mb.colors.resize(144);
+  on_ = true;
+  micros_ = 1000000;  // 1 second — past ignition
+  bs->run(&mb);
+  delete bs;
+  fprintf(stderr, "  test_load_production_assassin PASSED\n");
+}
+
+// ============================================================
 // Chimera Layer Isolation Tests
 // ============================================================
 
@@ -1082,6 +1304,15 @@ int main() {
   test_parse_rotate_colors_variation();
   test_parse_rgbarg();
   test_parse_intarg();
+
+  fprintf(stderr, "\n=== Production .Style File Tests ===\n");
+  test_load_production_calkestis();
+  test_load_production_chimera();
+  test_load_production_kyberradiance();
+  test_load_production_mercenary();
+  test_load_production_hati();
+  test_load_production_crispity();
+  test_load_production_assassin();
 
   fprintf(stderr, "\n=== Chimera Layer Isolation Tests ===\n");
   test_chimera_layer_isolation();

@@ -1,3 +1,4 @@
 config/torro_config.h
 .planning/
 .claude
+**/config/styles/**
