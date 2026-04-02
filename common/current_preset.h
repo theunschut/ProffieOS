@@ -4,6 +4,9 @@
 #include "preset.h"
 #include "file_reader.h"
 #include "blade_config.h"
+#include "lsfs.h"
+#include "../styles/blade_style.h"
+#include "../styles/sd_style.h"
 
 class CurrentPreset {
 public:
@@ -16,6 +19,7 @@ public:
   LSPtr<char> track;
 #if NUM_BLADES > 0
   LSPtr<char> current_style_[NUM_BLADES];
+  StyleFactory* current_style_factory_[NUM_BLADES] = {nullptr};
 #endif
   LSPtr<char> name;
   uint32_t variation;
@@ -85,7 +89,10 @@ public:
     font = "";
     track = "";
 #if NUM_BLADES > 0
-    for (size_t N = 0; N < NUM_BLADES; N++) current_style_[N] = "";
+    for (size_t N = 0; N < NUM_BLADES; N++) {
+      current_style_[N] = "";
+      current_style_factory_[N] = nullptr;
+    }
 #endif
     name = "";
     variation = 0;
@@ -184,6 +191,28 @@ public:
 #else
 	free(tmp);
 #endif
+	current_style++;
+	continue;
+      }
+      if (!strcmp(variable, "styledef")) {
+	char* path = f->readString();
+	if (path && path[0]) {
+#if NUM_BLADES > 0
+	  // Attempt to discover .style file via TryOpenStyleFile
+	  FileReader reader;
+	  if (TryOpenStyleFile(path, reader)) {
+	    // Create LazyStyleFactory with the discovered path
+	    // Note: path may be a temporary string; LazyStyleFactory copies it
+	    reader.Close();
+	    current_style_factory_[current_style] = new LazyStyleFactory(path);
+	  } else {
+	    STDERR << "STYLEDEF: failed to open file: " << path << "\n";
+	    if (path) free(path);
+	  }
+#else
+	  if (path) free(path);
+#endif
+	}
 	current_style++;
 	continue;
       }
