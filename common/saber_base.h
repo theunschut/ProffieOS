@@ -109,6 +109,7 @@ extern SaberBase* saberbases;
     /* ERRORS */                                \
     DEFINE_EFFECT(SD_CARD_NOT_FOUND)            \
     DEFINE_EFFECT(FONT_DIRECTORY_NOT_FOUND)     \
+    DEFINE_EFFECT(STYLE_PARSE_ERROR)            \
     DEFINE_EFFECT(VOICE_PACK_NOT_FOUND)         \
     DEFINE_EFFECT(ERROR_IN_BLADE_ARRAY)         \
     DEFINE_EFFECT(ERROR_IN_FONT_DIRECTORY)      \

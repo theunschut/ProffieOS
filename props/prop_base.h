@@ -394,9 +394,15 @@ public:
     if (current_preset_.current_style_factory_[N]) {                       \
       /* Dynamic style from SD card */                                     \
       tmp = current_preset_.current_style_factory_[N]->make();             \
+      if (!tmp) {                                                           \
+        ProffieOSErrors::style_parse_error();                              \
+      }                                                                     \
     } else {                                                                \
       /* Compiled style from string */                                     \
       tmp = style_parser.Parse(current_preset_.GetStyle(N));               \
+      if (!tmp) {                                                           \
+        ProffieOSErrors::style_parse_error();                              \
+      }                                                                     \
     }                                                                       \
     if (tmp) {                                                              \
       WRAP_BLADE_SHORTERNER(N)                                             \

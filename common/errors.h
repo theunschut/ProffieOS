@@ -12,6 +12,7 @@ class ProffieOSErrors {
 public:
   static void sd_card_not_found();
   static void font_directory_not_found();
+  static void style_parse_error();
   static void voice_pack_not_found();
   static void error_in_blade_array();
   static void error_in_font_directory();
@@ -59,6 +60,25 @@ void ProffieOSErrors::font_directory_not_found() {
   beeper.Beep(0.5,   174.61 * 2); // F4 - y
   beeper.Beep(0.5,   146.83 * 2); // D4 - not
   beeper.Beep(0.5,   130.81 * 2); // C4 - found
+  DodgeSound(2530);
+#endif
+#endif
+}
+
+void ProffieOSErrors::style_parse_error() {
+  SaberBase::DoEffect(EFFECT_STYLE_PARSE_ERROR, 0);
+  PVLOG_ERROR << "** ERROR - Style file parsing failed.\n"
+                 "** Check SD card for malformed .style file or missing styledef= path.\n"
+                 "** See https://pod.hubbe.net/troubleshooting/what-is-it-saying.html#style-parse-error\n";
+#ifdef ENABLE_AUDIO
+  if (SaberBase::sound_length > 0) return;
+#ifndef DISABLE_TALKIE
+  talkie.Say(talkie_style_parse_error, 25);
+  DodgeSound(2000);
+#else
+  beeper.Beep(0.5, 220.00 * 2); // A4 - Style
+  beeper.Beep(0.5, 130.81 * 2); // C4 - parse
+  beeper.Beep(0.5, 146.83 * 2); // D4 - error
   DodgeSound(2530);
 #endif
 #endif
