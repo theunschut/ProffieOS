@@ -374,7 +374,8 @@ public:
 
   void FreeBladeStyles() {
 #define UNSET_BLADE_STYLE(N) \
-    delete current_config->blade##N->UnSetStyle();
+    delete current_config->blade##N->UnSetStyle(); \
+    current_preset_.current_style_factory_[N] = nullptr;
     ONCEPERBLADE(UNSET_BLADE_STYLE)
   }
 
@@ -389,9 +390,18 @@ public:
 #define WRAP_BLADE_SHORTERNER(N)
 #endif
 #define SET_BLADE_STYLE(N) do {                                           \
-      BladeStyle* tmp = style_parser.Parse(current_preset_.GetStyle(N));  \
-    WRAP_BLADE_SHORTERNER(N)                                              \
-    current_config->blade##N->SetStyle(tmp);                              \
+      BladeStyle* tmp = nullptr;                                           \
+    if (current_preset_.current_style_factory_[N]) {                       \
+      /* Dynamic style from SD card */                                     \
+      tmp = current_preset_.current_style_factory_[N]->make();             \
+    } else {                                                                \
+      /* Compiled style from string */                                     \
+      tmp = style_parser.Parse(current_preset_.GetStyle(N));               \
+    }                                                                       \
+    if (tmp) {                                                              \
+      WRAP_BLADE_SHORTERNER(N)                                             \
+      current_config->blade##N->SetStyle(tmp);                             \
+    }                                                                       \
   } while (0);
 
     ONCEPERBLADE(SET_BLADE_STYLE)
