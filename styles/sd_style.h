@@ -772,7 +772,9 @@ public:
 // Expects tokenizer positioned at TOK_OPEN (<).
 static bool expectOpen(Tokenizer& tok) {
   if (tok.current() != TOK_OPEN) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: expected '<', got token " << (int)tok.current() << "\n";
+#endif  // ENABLE_DEBUG
     return false;
   }
   tok.next();  // consume <
@@ -781,7 +783,9 @@ static bool expectOpen(Tokenizer& tok) {
 
 static bool expectClose(Tokenizer& tok) {
   if (tok.current() != TOK_CLOSE) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: expected '>', got token " << (int)tok.current() << "\n";
+#endif  // ENABLE_DEBUG
     return false;
   }
   tok.next();  // consume >
@@ -790,7 +794,9 @@ static bool expectClose(Tokenizer& tok) {
 
 static bool expectComma(Tokenizer& tok) {
   if (tok.current() != TOK_COMMA) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: expected ',', got token " << (int)tok.current() << "\n";
+#endif  // ENABLE_DEBUG
     return false;
   }
   tok.next();  // consume ,
@@ -817,7 +823,9 @@ static int parseIntArg(Tokenizer& tok) {
       tok.next();  // consume "Int"
       if (!expectOpen(tok)) return -1;
       if (tok.current() != TOK_INT) {
+#ifdef ENABLE_DEBUG
         STDERR << "StyleFromSD: Int<> expects integer\n";
+#endif  // ENABLE_DEBUG
         return -1;
       }
       int v2 = tok.intValue();
@@ -825,10 +833,14 @@ static int parseIntArg(Tokenizer& tok) {
       if (!expectClose(tok)) return -1;
       return v2;
     }
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: expected integer or Int<N>, got: " << tok.identifier() << "\n";
+#endif  // ENABLE_DEBUG
     return -1;
   }
+#ifdef ENABLE_DEBUG
   STDERR << "StyleFromSD: expected integer argument\n";
+#endif  // ENABLE_DEBUG
   return -1;
 }
 
@@ -3070,7 +3082,9 @@ public:
     LSFS::LSFILE file = LSFS::Open(path_);
     if (!file) {
       ProffieOSErrors::font_directory_not_found();
+#ifdef ENABLE_DEBUG
       STDERR << "StyleFromSD: file not found: " << path_ << "\n";
+#endif  // ENABLE_DEBUG
       return nullptr;
     }
 
@@ -3079,7 +3093,9 @@ public:
     int n = file.read((uint8_t*)buf, sizeof(buf) - 1);
     file.close();
     if (n <= 0) {
+#ifdef ENABLE_DEBUG
       STDERR << "StyleFromSD: empty or unreadable file: " << path_ << "\n";
+#endif  // ENABLE_DEBUG
       return nullptr;
     }
     buf[n] = '\0';
@@ -3356,7 +3372,9 @@ static const StyleDispatch style_dispatch[] = {
 
 static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
   if (depth > MAX_PARSE_DEPTH) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: max recursion depth exceeded\n";
+#endif  // ENABLE_DEBUG
     return nullptr;
   }
   // Handle #RRGGBB hex color literals (PARSE-03)
@@ -3370,7 +3388,9 @@ static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
     return new RtNamedColor(color);
   }
   if (tok.current() != TOK_IDENT) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: expected identifier for color node\n";
+#endif  // ENABLE_DEBUG
     return nullptr;
   }
   const char* name = tok.identifier();
@@ -3404,13 +3424,17 @@ static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
   }
 
   // Unknown identifier — try to give a helpful error
+#ifdef ENABLE_DEBUG
   STDERR << "StyleFromSD: unknown color type: " << name << "\n";
+#endif  // ENABLE_DEBUG
   return nullptr;
 }
 
 static RtFuncNode* parseFuncNode(Tokenizer& tok, int depth) {
   if (depth > MAX_PARSE_DEPTH) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: max recursion depth exceeded\n";
+#endif  // ENABLE_DEBUG
     return nullptr;
   }
   // Integer literal → RtInt
@@ -3420,7 +3444,9 @@ static RtFuncNode* parseFuncNode(Tokenizer& tok, int depth) {
     return new RtInt(v);
   }
   if (tok.current() != TOK_IDENT) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: expected identifier for func node\n";
+#endif  // ENABLE_DEBUG
     return nullptr;
   }
   const char* name = tok.identifier();
@@ -3440,17 +3466,23 @@ static RtFuncNode* parseFuncNode(Tokenizer& tok, int depth) {
     }
   }
 
+#ifdef ENABLE_DEBUG
   STDERR << "StyleFromSD: unknown function type: " << name << "\n";
+#endif  // ENABLE_DEBUG
   return nullptr;
 }
 
 static RtTransNode* parseTransNode(Tokenizer& tok, int depth) {
   if (depth > MAX_PARSE_DEPTH) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: max recursion depth exceeded\n";
+#endif  // ENABLE_DEBUG
     return nullptr;
   }
   if (tok.current() != TOK_IDENT) {
+#ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: expected identifier for transition node\n";
+#endif  // ENABLE_DEBUG
     return nullptr;
   }
   const char* name = tok.identifier();
@@ -3463,7 +3495,9 @@ static RtTransNode* parseTransNode(Tokenizer& tok, int depth) {
     }
   }
 
+#ifdef ENABLE_DEBUG
   STDERR << "StyleFromSD: unknown transition type: " << name << "\n";
+#endif  // ENABLE_DEBUG
   return nullptr;
 }
 
