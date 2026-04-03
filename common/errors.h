@@ -76,6 +76,7 @@ void ProffieOSErrors::style_parse_error() {
 #ifdef ENABLE_AUDIO
   if (SaberBase::sound_length > 0) return;
 #ifndef DISABLE_TALKIE
+  //talkie.Say(talkie_style_parse_error, 25); // Doesn't exist yet, but probably should. Reusing the font directory now.
   talkie.Say(talkie_font_directory_15, 15);
   DodgeSound(2000);
 #else

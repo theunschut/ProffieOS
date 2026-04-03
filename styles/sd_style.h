@@ -8,6 +8,16 @@
 //
 // Requires: styles/blade_style.h, common/lsfs.h, common/errors.h
 
+#include "edit_mode.h"
+#include "../functions/hold_peak.h"
+#include "../functions/wavlen.h"
+#include "../functions/swing_speed.h"
+#include "../functions/blade_angle.h"
+#include "../functions/twist_angle.h"
+#include "../functions/clash_impact.h"
+#include "../functions/ramp.h"
+#include "../functions/battery_level.h"
+
 // ============================================================
 // SECTION 1: Runtime Node Base Classes
 // ============================================================
