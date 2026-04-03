@@ -229,7 +229,7 @@ private:
 // SECTION 4: Parser Constants and Forward Declarations
 // ============================================================
 
-static const int MAX_PARSE_DEPTH = 32;  // per D-17, PARSE-08
+static const int MAX_PARSE_DEPTH = 32;  // guards against stack overflow on deeply nested styles
 
 // Forward declarations for recursive descent parser
 static RtColorNode* parseColorNode(Tokenizer& tok, int depth);
@@ -846,7 +846,7 @@ static int parseIntArg(Tokenizer& tok) {
 
 
 // ============================================================
-// SECTION 14: Additional Color Wrapper Nodes (Plan 02)
+// SECTION 14: Additional Color Wrapper Nodes
 // ============================================================
 
 // --- Helper: Runtime function node wrapping a zero-arg compiled function ---
@@ -1984,7 +1984,7 @@ public:
 };
 
 // ============================================================
-// SECTION 15: Function Wrapper Nodes (Plan 02)
+// SECTION 15: Function Wrapper Nodes
 // ============================================================
 
 // --- IntArg<N, DEFAULT>: reads from CurrentArgParser, defaults to DEFAULT ---
@@ -2490,7 +2490,7 @@ private:
 };
 
 // ============================================================
-// SECTION 16: Transition Wrapper Nodes (Plan 02)
+// SECTION 16: Transition Wrapper Nodes
 // ============================================================
 
 // --- TrFadeX<FUNC>: fade with function-controlled duration ---
@@ -3075,10 +3075,9 @@ public:
   }
 
   BladeStyle* make() override {
-    // 1. Open file — SD card access deferred to here (lazy loading per API-03)
+    // 1. Open file — SD card access deferred to here (lazy loading)
     // NOTE: path_ must be absolute (e.g., "/styles/foo.style").
-    // Soundfont-relative path resolution is handled in Phase 2 (INTEG-01/INTEG-02)
-    // where CurrentPreset provides the font directory context.
+    // Runtime path resolution handled via TryOpenStyleFile() in lsfs.h
     LSFS::LSFILE file = LSFS::Open(path_);
     if (!file) {
       ProffieOSErrors::font_directory_not_found();
@@ -3146,7 +3145,7 @@ static RtTransNode* makeTrWipeIn(Tokenizer& tok, int depth);
 static RtTransNode* makeTrFade(Tokenizer& tok, int depth);
 static RtTransNode* makeTrInstant(Tokenizer& tok, int depth);
 
-// Plan 02 Color factory forward declarations
+// Color factory forward declarations
 static RtColorNode* makeHumpFlicker(Tokenizer& tok, int depth);
 static RtColorNode* makeHumpFlickerL(Tokenizer& tok, int depth);
 static RtColorNode* makeAudioFlicker(Tokenizer& tok, int depth);
@@ -3185,7 +3184,7 @@ static RtColorNode* makeLocalizedClashL(Tokenizer& tok, int depth);
 static RtColorNode* makeBlastL(Tokenizer& tok, int depth);
 static RtColorNode* makeSyncAltToVarianceL(Tokenizer& tok, int depth);
 
-// Plan 02 Function factory forward declarations
+// Function factory forward declarations
 static RtFuncNode* makeIntArg(Tokenizer& tok, int depth);
 static RtFuncNode* makeScale(Tokenizer& tok, int depth);
 static RtFuncNode* makeSum(Tokenizer& tok, int depth);
@@ -3221,7 +3220,7 @@ static RtFuncNode* makeVariation(Tokenizer& tok, int depth);
 static RtFuncNode* makeAltF(Tokenizer& tok, int depth);
 static RtFuncNode* makeBatteryLevel(Tokenizer& tok, int depth);
 
-// Plan 02 Transition factory forward declarations
+// Transition factory forward declarations
 static RtTransNode* makeTrFadeX(Tokenizer& tok, int depth);
 static RtTransNode* makeTrWipeX(Tokenizer& tok, int depth);
 static RtTransNode* makeTrWipeInX(Tokenizer& tok, int depth);
@@ -3254,11 +3253,11 @@ struct StyleDispatch {
 };
 
 static const StyleDispatch style_dispatch[] = {
-  // Color nodes from Plan 01
+  // Color nodes
   {"Layers",                   makeLayers,                  nullptr,                nullptr        },
   {"AlphaL",                   makeAlphaL,                  nullptr,                nullptr        },
   {"InOutTrL",                 makeInOutTrL,                nullptr,                nullptr        },
-  // Color nodes from Plan 02
+  // Additional color nodes
   {"Rgb16",                    makeRgb16,                   nullptr,                nullptr        },
   {"RgbArg",                   makeRgbArg,                  nullptr,                nullptr        },
   {"HumpFlicker",              makeHumpFlicker,             nullptr,                nullptr        },
@@ -3299,10 +3298,10 @@ static const StyleDispatch style_dispatch[] = {
   {"LocalizedClashL",          makeLocalizedClashL,         nullptr,                nullptr        },
   {"BlastL",                   makeBlastL,                  nullptr,                nullptr        },
   {"SyncAltToVarianceL",       makeSyncAltToVarianceL,      nullptr,                nullptr        },
-  // Function nodes from Plan 01
+  // Function nodes
   {"Int",                      nullptr,                     makeInt,                nullptr        },
   {"Ifon",                     nullptr,                     makeIfon,               nullptr        },
-  // Function nodes from Plan 02
+  // Additional function nodes
   {"IntArg",                   nullptr,                     makeIntArg,             nullptr        },
   {"Scale",                    nullptr,                     makeScale,              nullptr        },
   {"Sum",                      nullptr,                     makeSum,                nullptr        },
@@ -3338,12 +3337,12 @@ static const StyleDispatch style_dispatch[] = {
   {"Variation",                nullptr,                     makeVariation,          nullptr        },
   {"AltF",                     nullptr,                     makeAltF,               nullptr        },
   {"BatteryLevel",             nullptr,                     makeBatteryLevel,       nullptr        },
-  // Transition nodes from Plan 01
+  // Transition nodes
   {"TrWipe",                   nullptr,                     nullptr,                makeTrWipe     },
   {"TrWipeIn",                 nullptr,                     nullptr,                makeTrWipeIn   },
   {"TrFade",                   nullptr,                     nullptr,                makeTrFade     },
   {"TrInstant",                nullptr,                     nullptr,                makeTrInstant  },
-  // Transition nodes from Plan 02
+  // Additional transition nodes
   {"TrFadeX",                  nullptr,                     nullptr,                makeTrFadeX    },
   {"TrWipeX",                  nullptr,                     nullptr,                makeTrWipeX    },
   {"TrWipeInX",                nullptr,                     nullptr,                makeTrWipeInX  },
@@ -3377,7 +3376,7 @@ static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
 #endif  // ENABLE_DEBUG
     return nullptr;
   }
-  // Handle #RRGGBB hex color literals (PARSE-03)
+  // Handle #RRGGBB hex color literals
   if (tok.current() == TOK_HEX) {
     uint32_t hex = tok.hexValue();
     uint8_t r = (hex >> 16) & 0xFF;
@@ -3648,7 +3647,7 @@ static RtTransNode* makeTrInstant(Tokenizer& tok, int depth) {
 }
 
 // ============================================================
-// Plan 02 Factory Implementations — Color Nodes
+// Factory Implementations — Color Nodes
 // ============================================================
 
 // Helper: parse variadic COLOR args inside <...> until >
@@ -4307,7 +4306,7 @@ static RtColorNode* makeSyncAltToVarianceL(Tokenizer& tok, int depth) {
 }
 
 // ============================================================
-// Plan 02 Factory Implementations — Function Nodes
+// Factory Implementations — Function Nodes
 // ============================================================
 
 static RtFuncNode* makeIntArg(Tokenizer& tok, int depth) {
@@ -4628,7 +4627,7 @@ static RtFuncNode* makeBatteryLevel(Tokenizer& tok, int depth) {
 }
 
 // ============================================================
-// Plan 02 Factory Implementations — Transition Nodes
+// Factory Implementations — Transition Nodes
 // ============================================================
 
 static RtTransNode* makeTrFadeX(Tokenizer& tok, int depth) {
