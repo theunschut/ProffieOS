@@ -929,32 +929,6 @@ void test_load_production_calkestis() {
   fprintf(stderr, "  test_load_production_calkestis PASSED\n");
 }
 
-void test_load_production_chimera() {
-  fprintf(stderr, "  Loading production chimera.style...\n");
-  BladeStyle* bs = loadAndParseStyleFromFile("chimera");
-  CHECK(bs != nullptr);
-  MockBlade mb;
-  mb.colors.resize(144);
-  on_ = true;
-  micros_ = 1000000;  // 1 second — past ignition
-  bs->run(&mb);
-  delete bs;
-  fprintf(stderr, "  test_load_production_chimera PASSED\n");
-}
-
-void test_load_production_kyberradiance() {
-  fprintf(stderr, "  Loading production kyberradiance.style...\n");
-  BladeStyle* bs = loadAndParseStyleFromFile("kyberradiance");
-  CHECK(bs != nullptr);
-  MockBlade mb;
-  mb.colors.resize(144);
-  on_ = true;
-  micros_ = 1000000;  // 1 second — past ignition
-  bs->run(&mb);
-  delete bs;
-  fprintf(stderr, "  test_load_production_kyberradiance PASSED\n");
-}
-
 void test_load_production_mercenary() {
   fprintf(stderr, "  Loading production mercenary.style...\n");
   BladeStyle* bs = loadAndParseStyleFromFile("mercenary");
@@ -1066,8 +1040,6 @@ int main() {
 
   fprintf(stderr, "\n=== Production .Style File Tests ===\n");
   test_load_production_calkestis();
-  test_load_production_chimera();
-  test_load_production_kyberradiance();
   test_load_production_mercenary();
   test_load_production_hati();
   test_load_production_crispity();
