@@ -727,53 +727,13 @@ public:
 };
 #endif
 
-// ============================================================
-// SECTION: Style File Path Discovery (Phase 2 Integration)
-// ============================================================
-
 // Forward declarations for current_directory navigation (defined in ProffieOS.ino)
+// Used by TryOpenStyleFile() in file_reader.h.
+// Guarded so test files that mock these functions with macros do not conflict.
+#ifndef current_directory
 extern char current_directory[128];
 extern const char* last_current_directory();
 extern const char* previous_current_directory(const char* dir);
-
-// TryOpenStyleFile: Discover and open a .style file
-//
-// Searches for style_filename through the current_directory array
-// (backward order, following the ReadInCurrentDir() pattern).
-//
-// Absolute paths (starting with "/") are opened directly.
-// Relative paths are searched in each directory via backward iteration.
-//
-// Returns: true if file found and opened in reader; false otherwise.
-// The caller is responsible for calling reader.Close() when done.
-//
-// Error handling: Returns false if file not found; does NOT log errors.
-// Caller will handle error reporting via AllocateBladeStyles.
-inline bool TryOpenStyleFile(const char* style_filename, FileReader& reader) {
-  if (!style_filename || !style_filename[0]) {
-    return false;
-  }
-
-  // Absolute path: open directly
-  if (style_filename[0] == '/') {
-    if (reader.Open(style_filename)) {
-      return true;
-    }
-    return false;
-  }
-
-  // Relative path: search backward through current_directory
-  // Matches the pattern in config_file.h::ReadInCurrentDir()
-  for (const char* dir = last_current_directory(); dir; dir = previous_current_directory(dir)) {
-    PathHelper full_path(dir, style_filename);
-    if (LSFS::Exists(full_path)) {
-      if (reader.Open(full_path)) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
+#endif  // current_directory
 
 #endif

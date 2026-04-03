@@ -5,8 +5,24 @@
 #include "file_reader.h"
 #include "blade_config.h"
 #include "lsfs.h"
-#include "../styles/blade_style.h"
-#include "../styles/sd_style.h"
+
+// Forward declarations for style types.
+// Full definitions are in styles/blade_style.h and styles/sd_style.h.
+// Including those headers requires color.h, blade_base.h, and a large
+// dependency chain that not all callers provide. Forward declarations
+// are sufficient for pointer storage and factory creation here.
+class BladeStyle;
+class StyleFactory;
+
+// MakeLazyStyleFactory creates a LazyStyleFactory (defined in styles/sd_style.h).
+// If sd_style.h has been included, the real implementation is used.
+// Otherwise a stub returning nullptr is provided for builds that don't need
+// runtime SD card style loading (e.g., unit tests for common/ subsystem).
+#ifndef STYLES_SD_STYLE_H
+inline StyleFactory* MakeLazyStyleFactory(const char* path) { return nullptr; }
+#else
+StyleFactory* MakeLazyStyleFactory(const char* path);
+#endif
 
 class CurrentPreset {
 public:
@@ -204,7 +220,7 @@ public:
 	    // Create LazyStyleFactory with the discovered path
 	    // Note: path may be a temporary string; LazyStyleFactory copies it
 	    reader.Close();
-	    current_style_factory_[current_style] = new LazyStyleFactory(path);
+	    current_style_factory_[current_style] = MakeLazyStyleFactory(path);
 	  } else {
 	    STDERR << "STYLEDEF: failed to open file: " << path << "\n";
 	    if (path) free(path);

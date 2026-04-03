@@ -3120,6 +3120,13 @@ private:
 // SECTION 16: StyleFromSD() — Public API
 // ============================================================
 
+// MakeLazyStyleFactory: Create a LazyStyleFactory without exposing the class definition.
+// Used by current_preset.h to create factories for styledef= entries without
+// requiring the full sd_style.h include chain.
+inline StyleFactory* MakeLazyStyleFactory(const char* path) {
+  return new LazyStyleFactory(path);
+}
+
 // Usage: StyleFromSD("path/to/style.style")
 // Returns StyleAllocator (= class StyleFactory*) — interchangeable with StylePtr<>().
 // SD card is NOT accessed here; only when make() is called on preset selection.

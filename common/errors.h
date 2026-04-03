@@ -65,6 +65,9 @@ void ProffieOSErrors::font_directory_not_found() {
 #endif
 }
 
+// style_parse_error requires EFFECT_STYLE_PARSE_ERROR from saber_base.h.
+// Only compiled when saber_base.h has been included (checked via its header guard).
+#ifdef COMMON_SABER_BASE_H
 void ProffieOSErrors::style_parse_error() {
   SaberBase::DoEffect(EFFECT_STYLE_PARSE_ERROR, 0);
   PVLOG_ERROR << "** ERROR - Style file parsing failed.\n"
@@ -83,6 +86,7 @@ void ProffieOSErrors::style_parse_error() {
 #endif
 #endif
 }
+#endif  // COMMON_SABER_BASE_H
 
 void ProffieOSErrors::voice_pack_not_found() {
   SaberBase::DoEffect(EFFECT_VOICE_PACK_NOT_FOUND, 0);
