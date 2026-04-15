@@ -3140,6 +3140,10 @@ private:
 // The actual LazyStyleFactory is allocated lazily on first make() call.
 class StaticLazyStyleFactory : public StyleFactory {
 public:
+  // Default constructor for static array allocation.
+  // Initializes with nullptr path; replaced via placement new in MakeLazyStyleFactory().
+  StaticLazyStyleFactory() : path_(nullptr), factory_(nullptr) {}
+
   explicit StaticLazyStyleFactory(const char* path) : path_(path), factory_(nullptr) {}
 
   ~StaticLazyStyleFactory() {
