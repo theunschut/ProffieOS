@@ -19,9 +19,9 @@ class StyleFactory;
 // Otherwise a stub returning nullptr is provided for builds that don't need
 // runtime SD card style loading (e.g., unit tests for common/ subsystem).
 #ifndef STYLES_SD_STYLE_H
-inline StyleFactory* MakeLazyStyleFactory(const char* path) { return nullptr; }
+inline StyleFactory* MakeLazyStyleFactory(const char* path, bool owns_path = false) { return nullptr; }
 #else
-StyleFactory* MakeLazyStyleFactory(const char* path);
+StyleFactory* MakeLazyStyleFactory(const char* path, bool owns_path = false);
 #endif
 
 class CurrentPreset {
@@ -214,17 +214,12 @@ public:
 	char* path = f->readString();
 	if (path && path[0]) {
 #if NUM_BLADES > 0
-	  // Attempt to discover .style file via TryOpenStyleFile
-	  FileReader reader;
-	  if (TryOpenStyleFile(path, reader)) {
-	    // Create LazyStyleFactory with the discovered path
-	    // Note: path may be a temporary string; LazyStyleFactory copies it
-	    reader.Close();
-	    current_style_factory_[current_style] = MakeLazyStyleFactory(path);
-	  } else {
-	    STDERR << "STYLEDEF: failed to open file: " << path << "\n";
-	    if (path) free(path);
-	  }
+	  // Create LazyStyleFactory - DO NOT verify file exists here.
+	  // Verification is deferred until make() is called when style is actually used.
+	  // This prevents hangs during preset loading if SD card is slow or unresponsive.
+	  // Pass owns_path=true since path is dynamically allocated (from readString).
+	  // The factory will take ownership and free it during destruction.
+	  current_style_factory_[current_style] = MakeLazyStyleFactory(path, true);
 #else
 	  if (path) free(path);
 #endif

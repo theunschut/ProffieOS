@@ -3142,12 +3142,14 @@ class StaticLazyStyleFactory : public StyleFactory {
 public:
   // Default constructor for static array allocation.
   // Initializes with nullptr path; replaced via placement new in MakeLazyStyleFactory().
-  StaticLazyStyleFactory() : path_(nullptr), factory_(nullptr) {}
+  StaticLazyStyleFactory() : path_(nullptr), factory_(nullptr), owns_path_(false) {}
 
-  explicit StaticLazyStyleFactory(const char* path) : path_(path), factory_(nullptr) {}
+  explicit StaticLazyStyleFactory(const char* path, bool owns_path = false)
+    : path_(path), factory_(nullptr), owns_path_(owns_path) {}
 
   ~StaticLazyStyleFactory() {
     if (factory_) delete factory_;
+    if (owns_path_ && path_) free(const_cast<char*>(path_));
   }
 
   BladeStyle* make() override {
@@ -3166,6 +3168,7 @@ public:
 private:
   const char* path_;
   LazyStyleFactory* factory_;
+  bool owns_path_;
 };
 
 // Global pool of pre-allocated StaticLazyStyleFactory instances.
@@ -3178,7 +3181,9 @@ static int g_static_lazy_factory_count = 0;
 // MakeLazyStyleFactory: Create a StaticLazyStyleFactory without malloc during global init.
 // Used by current_preset.h and StyleFromSD() to create factories for preset arrays.
 // Returns a pointer to a statically-allocated factory object (no new/malloc during init).
-inline StyleFactory* MakeLazyStyleFactory(const char* path) {
+// owns_path: If true, factory will free() the path string on destruction (for dynamic paths from presets.ini).
+//            If false (default), path is assumed to be a const literal and is not freed.
+inline StyleFactory* MakeLazyStyleFactory(const char* path, bool owns_path = false) {
   if (g_static_lazy_factory_count >= MAX_STATIC_LAZY_FACTORIES) {
     STDERR << "MakeLazyStyleFactory: exceeded MAX_STATIC_LAZY_FACTORIES (" << MAX_STATIC_LAZY_FACTORIES << ")\n";
     return nullptr;
@@ -3186,7 +3191,7 @@ inline StyleFactory* MakeLazyStyleFactory(const char* path) {
 
   // Use placement new to construct the factory in pre-allocated storage
   int idx = g_static_lazy_factory_count++;
-  new (&g_static_lazy_factories[idx]) StaticLazyStyleFactory(path);
+  new (&g_static_lazy_factories[idx]) StaticLazyStyleFactory(path, owns_path);
   return &g_static_lazy_factories[idx];
 }
 
