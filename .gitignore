@@ -1,4 +1,5 @@
 config/torro_config.h
+config/torro_testboard_config.h
 .planning/
 .claude
 **/config/styles/**

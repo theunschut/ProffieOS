@@ -8,6 +8,11 @@
 //
 // Requires: styles/blade_style.h, common/lsfs.h, common/errors.h
 
+// Explicit includes for required dependencies
+#include "blade_style.h"
+#include "../common/lsfs.h"
+#include "../common/errors.h"
+
 #include "edit_mode.h"
 #include "../functions/hold_peak.h"
 #include "../functions/wavlen.h"
@@ -3073,15 +3078,14 @@ private:
 
 class LazyStyleFactory : public StyleFactory {
 public:
-  explicit LazyStyleFactory(const char* path) {
-    // Copy path into owned buffer — path string may be a temporary literal
-    int len = (int)strlen(path);
-    path_ = new char[len + 1];
-    memcpy(path_, path, (size_t)(len + 1));
+  explicit LazyStyleFactory(const char* path) : path_(path) {
+    // Store pointer to path string (expected to be a const string literal in preset definition).
+    // Do NOT allocate/copy at global scope — STM32 malloc not ready during global initialization.
+    // Paths in preset arrays are string literals in flash, safe to reference without copying.
   }
 
   ~LazyStyleFactory() {
-    delete[] path_;
+    // No-op: path_ points to const data in flash, not heap
   }
 
   BladeStyle* make() override {
@@ -3123,25 +3127,72 @@ public:
   }
 
 private:
-  char* path_;
+  const char* path_;
 };
 
 // ============================================================
 // SECTION 16: StyleFromSD() — Public API
 // ============================================================
 
-// MakeLazyStyleFactory: Create a LazyStyleFactory without exposing the class definition.
-// Used by current_preset.h to create factories for styledef= entries without
-// requiring the full sd_style.h include chain.
+// StaticLazyStyleFactory: Wrapper that defers factory heap allocation.
+// Avoids malloc() during global static initialization (before heap is ready).
+// The wrapper itself is stack-allocated (no malloc needed).
+// The actual LazyStyleFactory is allocated lazily on first make() call.
+class StaticLazyStyleFactory : public StyleFactory {
+public:
+  explicit StaticLazyStyleFactory(const char* path) : path_(path), factory_(nullptr) {}
+
+  ~StaticLazyStyleFactory() {
+    if (factory_) delete factory_;
+  }
+
+  BladeStyle* make() override {
+    // Lazy-allocate the real LazyStyleFactory on first call (during preset selection in setup()).
+    // By this time, malloc() has been initialized and SD card is ready.
+    if (!factory_) {
+      factory_ = new LazyStyleFactory(path_);
+      if (!factory_) {
+        STDERR << "StaticLazyStyleFactory: Failed to allocate LazyStyleFactory for " << path_ << "\n";
+        return nullptr;
+      }
+    }
+    return factory_->make();
+  }
+
+private:
+  const char* path_;
+  LazyStyleFactory* factory_;
+};
+
+// Global pool of pre-allocated StaticLazyStyleFactory instances.
+// These are statically allocated (no malloc during global init).
+// Each StyleFromSD() call uses one slot from this pool.
+static const int MAX_STATIC_LAZY_FACTORIES = 64;
+static StaticLazyStyleFactory g_static_lazy_factories[MAX_STATIC_LAZY_FACTORIES];
+static int g_static_lazy_factory_count = 0;
+
+// MakeLazyStyleFactory: Create a StaticLazyStyleFactory without malloc during global init.
+// Used by current_preset.h and StyleFromSD() to create factories for preset arrays.
+// Returns a pointer to a statically-allocated factory object (no new/malloc during init).
 inline StyleFactory* MakeLazyStyleFactory(const char* path) {
-  return new LazyStyleFactory(path);
+  if (g_static_lazy_factory_count >= MAX_STATIC_LAZY_FACTORIES) {
+    STDERR << "MakeLazyStyleFactory: exceeded MAX_STATIC_LAZY_FACTORIES (" << MAX_STATIC_LAZY_FACTORIES << ")\n";
+    return nullptr;
+  }
+
+  // Use placement new to construct the factory in pre-allocated storage
+  int idx = g_static_lazy_factory_count++;
+  new (&g_static_lazy_factories[idx]) StaticLazyStyleFactory(path);
+  return &g_static_lazy_factories[idx];
 }
 
 // Usage: StyleFromSD("path/to/style.style")
 // Returns StyleAllocator (= class StyleFactory*) — interchangeable with StylePtr<>().
-// SD card is NOT accessed here; only when make() is called on preset selection.
+// Safe for use in global static initialization (Preset array definition).
+// NO malloc() during global initialization — factory is statically allocated.
+// SD card is NOT accessed until make() is called on preset selection (lazy loading).
 StyleAllocator StyleFromSD(const char* path) {
-  return new LazyStyleFactory(path);
+  return MakeLazyStyleFactory(path);
 }
 
 
