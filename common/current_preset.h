@@ -35,7 +35,9 @@ public:
   LSPtr<char> track;
 #if NUM_BLADES > 0
   LSPtr<char> current_style_[NUM_BLADES];
-  StyleFactory* current_style_factory_[NUM_BLADES] = {nullptr};
+  // ONCEPERBLADE uses 1-based indexing (F(1), F(2), ...), so allocate NUM_BLADES+1
+  // to accommodate indices [1..NUM_BLADES]. Index [0] is unused.
+  StyleFactory* current_style_factory_[NUM_BLADES + 1] = {};
 #endif
   LSPtr<char> name;
   uint32_t variation;

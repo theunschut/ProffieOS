@@ -3183,7 +3183,7 @@ static int g_static_lazy_factory_count = 0;
 // Returns a pointer to a statically-allocated factory object (no new/malloc during init).
 // owns_path: If true, factory will free() the path string on destruction (for dynamic paths from presets.ini).
 //            If false (default), path is assumed to be a const literal and is not freed.
-inline StyleFactory* MakeLazyStyleFactory(const char* path, bool owns_path = false) {
+inline StyleFactory* MakeLazyStyleFactory(const char* path, bool owns_path) {
   if (g_static_lazy_factory_count >= MAX_STATIC_LAZY_FACTORIES) {
     STDERR << "MakeLazyStyleFactory: exceeded MAX_STATIC_LAZY_FACTORIES (" << MAX_STATIC_LAZY_FACTORIES << ")\n";
     return nullptr;
@@ -3201,7 +3201,7 @@ inline StyleFactory* MakeLazyStyleFactory(const char* path, bool owns_path = fal
 // NO malloc() during global initialization — factory is statically allocated.
 // SD card is NOT accessed until make() is called on preset selection (lazy loading).
 StyleAllocator StyleFromSD(const char* path) {
-  return MakeLazyStyleFactory(path);
+  return MakeLazyStyleFactory(path, false);  // false: path is const literal in preset array
 }
 
 
