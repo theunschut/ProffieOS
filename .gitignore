@@ -3,3 +3,37 @@ config/torro_testboard_config.h
 .planning/
 .claude
 **/config/styles/**
+
+# Test files created by the run-tests.sh script.
+blades/tests
+blades/tests.d
+common/presets.bak
+common/presets.ini
+common/presets.tmp
+common/test2
+common/test2.d
+common/testconfig.ini
+common/testconfig.tmp
+common/tests
+common/tests.d
+sound/testfont/hum/000/000.wav
+sound/testfont/hum/000/001.wav
+sound/testfont/hum/000/002.wav
+sound/testfont/hum/001/000.wav
+sound/testfont/hum/001/001.wav
+sound/testfont/hum/001/002.wav
+sound/testfont/hum/002/000.wav
+sound/testfont/hum/002/001.wav
+sound/testfont/hum/002/002.wav
+sound/talkie_test
+sound/talkie_test.d
+sound/test22k.wav
+sound/test44k.wav
+sound/test48k.wav
+sound/tests
+sound/tests.d
+sound/zero.wav
+
+# Benchmark artifacts created by Phase 8 performance testing
+styles/sd_style_bench
+styles/sd_style_bench.d
