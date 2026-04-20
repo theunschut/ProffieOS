@@ -44,6 +44,22 @@ buttons-test:
 display-test:
 	(cd display && $(MAKE) test)
 
+# Performance Benchmarking (Phase 8)
+# Measures compiled baseline vs SD-loaded style performance
+# Run: make test-bench (outputs table comparing parse time, frame timing, variance)
+test-bench: bin/sd_style_bench
+	./bin/sd_style_bench
+
+bench: test-bench
+
+bin/sd_style_bench: styles/sd_style_bench.cpp
+	mkdir -p ./bin
+	g++ -std=c++14 -Os -I. -Istyles -Icommon styles/sd_style_bench.cpp -o ./bin/sd_style_bench -lm
+
+clean-bench:
+	rm -f ./bin/sd_style_bench
+	rm -rf ./bin
+
 subtest:
 	rm -r test-$(TESTSUBDIR) || :
 	mkdir test-$(TESTSUBDIR)
