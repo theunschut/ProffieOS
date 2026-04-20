@@ -109,6 +109,45 @@ public:
 };
 
 // ============================================================
+// SECTION 3: Profiling Instrumentation (Optional)
+// ============================================================
+// Global profiling counters — enabled via -DENABLE_PROFILE_PARSER
+#ifdef ENABLE_PROFILE_PARSER
+static uint32_t g_profile_node_count_color = 0;
+static uint32_t g_profile_node_count_func = 0;
+static uint32_t g_profile_node_count_trans = 0;
+static uint32_t g_profile_recursion_depth_max = 0;
+static uint32_t g_profile_alloc_bytes = 0;
+
+// Reset counters for each parse operation
+inline void profile_reset_counters() {
+  g_profile_node_count_color = 0;
+  g_profile_node_count_func = 0;
+  g_profile_node_count_trans = 0;
+  g_profile_recursion_depth_max = 0;
+  g_profile_alloc_bytes = 0;
+}
+
+// Track node allocation
+inline void profile_track_node_alloc(const char* type, uint32_t size, int depth) {
+  if (strcmp(type, "color") == 0) {
+    g_profile_node_count_color++;
+  } else if (strcmp(type, "func") == 0) {
+    g_profile_node_count_func++;
+  } else if (strcmp(type, "trans") == 0) {
+    g_profile_node_count_trans++;
+  }
+  if (depth > (int)g_profile_recursion_depth_max) {
+    g_profile_recursion_depth_max = (uint32_t)depth;
+  }
+  g_profile_alloc_bytes += size;
+}
+#else
+inline void profile_reset_counters() {}
+inline void profile_track_node_alloc(const char* type, uint32_t size, int depth) {}
+#endif
+
+// ============================================================
 // SECTION 3: Tokenizer
 // ============================================================
 
@@ -3089,6 +3128,11 @@ public:
   }
 
   BladeStyle* make() override {
+#ifdef ENABLE_PROFILE_PARSER
+    profile_reset_counters();
+    uint32_t parse_phase_start = micros();
+#endif
+
     // 1. Open file — SD card access deferred to here (lazy loading)
     // NOTE: path_ must be absolute (e.g., "/styles/foo.style").
     // Runtime path resolution handled via TryOpenStyleFile() in lsfs.h
@@ -3113,14 +3157,45 @@ public:
     }
     buf[n] = '\0';
 
+#ifdef ENABLE_PROFILE_PARSER
+    uint32_t tokenize_start = micros();
+#endif
+
     // 3. Tokenize and parse
     Tokenizer tok(buf);
     tok.next();  // prime the first token
+
+#ifdef ENABLE_PROFILE_PARSER
+    uint32_t tokenize_end = micros();
+    uint32_t profile_tokenize_us = tokenize_end - tokenize_start;
+#endif
+
     RtColorNode* root = parseColorNode(tok, 0);
     if (!root) {
       // Error already logged by parser
       return nullptr;
     }
+
+#ifdef ENABLE_PROFILE_PARSER
+    uint32_t node_creation_end = micros();
+    uint32_t profile_node_creation_us = node_creation_end - tokenize_end;
+
+    // Guard against stack overflow: warn if recursion depth is excessive
+    if (g_profile_recursion_depth_max > 30) {
+      STDOUT << "WARNING: Recursion depth " << g_profile_recursion_depth_max
+             << " approaches stack limit for " << path_ << "\n";
+    }
+
+    // Output profiling summary
+    STDOUT << "PROFILE_PARSER: " << path_ << "\n"
+           << "  Tokenize: " << profile_tokenize_us << " us\n"
+           << "  Node Creation: " << profile_node_creation_us << " us\n"
+           << "  Max Recursion Depth: " << g_profile_recursion_depth_max << "\n"
+           << "  Color Nodes: " << g_profile_node_count_color << "\n"
+           << "  Func Nodes: " << g_profile_node_count_func << "\n"
+           << "  Trans Nodes: " << g_profile_node_count_trans << "\n"
+           << "  Total Bytes: " << g_profile_alloc_bytes << "\n";
+#endif
 
     // 4. Wrap in RuntimeBladeStyle (takes ownership of root)
     return new RuntimeBladeStyle(root);
@@ -3447,6 +3522,10 @@ static const StyleDispatch style_dispatch[] = {
 // ============================================================
 
 static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
+#ifdef ENABLE_PROFILE_PARSER
+  profile_track_node_alloc("color", 0, depth);
+#endif
+
   if (depth > MAX_PARSE_DEPTH) {
 #ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: max recursion depth exceeded\n";
@@ -3461,7 +3540,11 @@ static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
     uint8_t b = hex & 0xFF;
     RGBA_um color = makeRGBA(r, g, b);
     tok.next();
-    return new RtNamedColor(color);
+    RtNamedColor* node = new RtNamedColor(color);
+#ifdef ENABLE_PROFILE_PARSER
+    if (node) g_profile_alloc_bytes += sizeof(*node);
+#endif
+    return node;
   }
   if (tok.current() != TOK_IDENT) {
 #ifdef ENABLE_DEBUG
@@ -3475,7 +3558,11 @@ static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
   NamedColorResult nc = lookupNamedColor(name);
   if (nc.found) {
     tok.next();  // consume identifier
-    return new RtNamedColor(nc.color);
+    RtNamedColor* node = new RtNamedColor(nc.color);
+#ifdef ENABLE_PROFILE_PARSER
+    if (node) g_profile_alloc_bytes += sizeof(*node);
+#endif
+    return node;
   }
 
   // Rgb<R,G,B> special case
@@ -3507,6 +3594,10 @@ static RtColorNode* parseColorNode(Tokenizer& tok, int depth) {
 }
 
 static RtFuncNode* parseFuncNode(Tokenizer& tok, int depth) {
+#ifdef ENABLE_PROFILE_PARSER
+  profile_track_node_alloc("func", 0, depth);
+#endif
+
   if (depth > MAX_PARSE_DEPTH) {
 #ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: max recursion depth exceeded\n";
@@ -3517,7 +3608,11 @@ static RtFuncNode* parseFuncNode(Tokenizer& tok, int depth) {
   if (tok.current() == TOK_INT) {
     int v = tok.intValue();
     tok.next();
-    return new RtInt(v);
+    RtInt* node = new RtInt(v);
+#ifdef ENABLE_PROFILE_PARSER
+    if (node) g_profile_alloc_bytes += sizeof(*node);
+#endif
+    return node;
   }
   if (tok.current() != TOK_IDENT) {
 #ifdef ENABLE_DEBUG
@@ -3549,6 +3644,10 @@ static RtFuncNode* parseFuncNode(Tokenizer& tok, int depth) {
 }
 
 static RtTransNode* parseTransNode(Tokenizer& tok, int depth) {
+#ifdef ENABLE_PROFILE_PARSER
+  profile_track_node_alloc("trans", 0, depth);
+#endif
+
   if (depth > MAX_PARSE_DEPTH) {
 #ifdef ENABLE_DEBUG
     STDERR << "StyleFromSD: max recursion depth exceeded\n";
@@ -3567,7 +3666,11 @@ static RtTransNode* parseTransNode(Tokenizer& tok, int depth) {
   for (int i = 0; style_dispatch[i].name; i++) {
     if (strcmp(name, style_dispatch[i].name) == 0 && style_dispatch[i].make_trans) {
       tok.next();  // consume identifier
-      return style_dispatch[i].make_trans(tok, depth + 1);
+      RtTransNode* node = style_dispatch[i].make_trans(tok, depth + 1);
+#ifdef ENABLE_PROFILE_PARSER
+      if (node) g_profile_alloc_bytes += sizeof(*node);
+#endif
+      return node;
     }
   }
 
