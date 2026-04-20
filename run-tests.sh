@@ -39,6 +39,17 @@ MSYS_NO_PATHCONV=1 docker run --rm \
       fi
     done
 
+    # Phase 8: Performance benchmark for SD style loading
+    echo ""
+    echo "--- Benchmark: SD Style Performance ---"
+    if (cd styles && make test-bench); then
+      echo "--- benchmark: PASSED ---"
+      PASS=$((PASS + 1))
+    else
+      echo "--- benchmark: FAILED ---"
+      FAIL=$((FAIL + 1))
+    fi
+
     echo ""
     echo "=== Results: $PASS passed, $FAIL failed ==="
     if [ "$FAIL" -gt 0 ]; then
