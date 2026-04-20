@@ -30,6 +30,9 @@ struct V3 {
   float x, y, z;
 };
 
+// Forward declare Looper before defining MockFuse
+class Looper;
+
 struct MockFuse {
   float angle1_ = 0.0;
   float angle1() { return angle1_; }
@@ -53,7 +56,7 @@ struct MockDynamicMixer {
   int32_t audio_volume() const { return 100000; }
 };
 
-MockFuse fusor;
+MockFuse mock_fusor_;
 BM battery_monitor;
 MockDynamicMixer dynamic_mixer;
 
@@ -86,6 +89,9 @@ int GetBladeNumber(BladeBase* blad) { return 0; }
 
 class Looper {
 public:
+  virtual ~Looper() {}
+  virtual const char* name() = 0;
+  virtual void Loop() = 0;
   static void DoHFLoop() {}
 };
 
@@ -110,6 +116,14 @@ Monitoring monitor;
 
 #include "../common/color.h"
 #include "../blades/blade_base.h"
+
+// ============================================================
+// Mock SaberBase static members
+// ============================================================
+SaberBase::LockupType SaberBase::lockup_ = SaberBase::LOCKUP_NONE;
+uint32_t SaberBase::current_variation_ = 0;
+float SaberBase::clash_strength_ = 0.0;
+
 
 // ============================================================
 // SECTION 1: Performance Measurement Structures
@@ -178,6 +192,54 @@ public:
 // ============================================================
 
 #include "sd_style.h"
+
+// ============================================================
+// Provide CurrentArgParser definition (declared as extern in arg_parser.h)
+// ============================================================
+class BenchArgParser : public ArgParserInterface {
+public:
+  const char* GetArg(int argnum, const char* type, const char* default_value) override {
+    return default_value;
+  }
+  void Shift(int num) override {}
+};
+BenchArgParser bench_parser;
+ArgParserInterface* CurrentArgParser = &bench_parser;
+
+// ============================================================
+// ProffieOSErrors implementations for benchmark
+// ============================================================
+void ProffieOSErrors::font_directory_not_found() {
+  fprintf(stderr, "ERROR: Font directory not found\n");
+}
+
+void ProffieOSErrors::sd_card_not_found() {
+  fprintf(stderr, "ERROR: SD card not found\n");
+}
+
+void ProffieOSErrors::style_parse_error() {
+  fprintf(stderr, "ERROR: Style parse error\n");
+}
+
+void ProffieOSErrors::voice_pack_not_found() {
+  fprintf(stderr, "ERROR: Voice pack not found\n");
+}
+
+void ProffieOSErrors::error_in_blade_array() {
+  fprintf(stderr, "ERROR: Error in blade array\n");
+}
+
+void ProffieOSErrors::error_in_font_directory() {
+  fprintf(stderr, "ERROR: Error in font directory\n");
+}
+
+void ProffieOSErrors::error_in_voice_pack_version() {
+  fprintf(stderr, "ERROR: Error in voice pack version\n");
+}
+
+void ProffieOSErrors::low_battery() {
+  fprintf(stderr, "ERROR: Low battery\n");
+}
 
 // ============================================================
 // SECTION 3: Compiled Baseline Measurement

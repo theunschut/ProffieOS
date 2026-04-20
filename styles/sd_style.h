@@ -35,6 +35,11 @@
 #include "pulsing.h"
 #include "blast.h"
 #include "brown_noise_flicker.h"
+
+// Function templates needed by runtime parser
+#include "../functions/sound_level.h"
+#include "../functions/bump.h"
+#include "../functions/smoothstep.h"
 #include "lockup.h"
 
 // ============================================================
