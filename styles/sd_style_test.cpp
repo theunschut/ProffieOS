@@ -487,7 +487,8 @@ void test_style_from_sd_file() {
   // Just verify it doesn't crash — detailed color checks in Plan 04
 
   delete style;
-  delete factory;
+  // factory is statically allocated by StyleFromSD() via MakeLazyStyleFactory() —
+  // must NOT be deleted; it lives in g_static_lazy_factories[]
   unlink("test_basic.style");
   fprintf(stderr, "  test_style_from_sd_file PASSED\n");
 }
@@ -498,7 +499,7 @@ void test_style_from_sd_missing_file() {
   CHECK(factory != nullptr);  // Factory itself is always created
   BladeStyle* style = factory->make();
   CHECK(style == nullptr);    // make() returns nullptr for missing file
-  delete factory;
+  // factory is statically allocated — must NOT be deleted
   fprintf(stderr, "  test_style_from_sd_missing_file PASSED\n");
 }
 
@@ -620,7 +621,7 @@ static BladeStyle* parseStyleFromFile(const char* path, const char* content) {
   StyleAllocator factory = StyleFromSD(path);
   if (!factory) { unlink(path); return nullptr; }
   BladeStyle* bs = factory->make();
-  delete factory;
+  // factory is statically allocated — must NOT be deleted
   unlink(path);
   return bs;
 }
