@@ -480,14 +480,38 @@ void test_backward_compatibility_rom_preset() {
 int main() {
   STDOUT << "=== SD Style Integration Tests ===\n\n";
 
+  fprintf(stderr, "Starting test_current_preset_factory_storage\n");
+  fflush(stderr);
   test_current_preset_factory_storage();
+  fprintf(stderr, "Completed test_current_preset_factory_storage\n");
+  fflush(stderr);
+
   test_dual_mode_allocation_factory_path();
+  fprintf(stderr, "Completed test_dual_mode_allocation_factory_path\n");
+  fflush(stderr);
+
   test_dual_mode_allocation_factory_failure();
+  fprintf(stderr, "Completed test_dual_mode_allocation_factory_failure\n");
+  fflush(stderr);
+
   test_free_blade_styles_cleanup();
+  fprintf(stderr, "Completed test_free_blade_styles_cleanup\n");
+  fflush(stderr);
+
   test_multi_blade_independence();
+  fprintf(stderr, "Completed test_multi_blade_independence\n");
+  fflush(stderr);
+
   test_parse_failure_error_effect();
+  fprintf(stderr, "Completed test_parse_failure_error_effect\n");
+  fflush(stderr);
+
   test_backward_compatibility_rom_preset();
+  fprintf(stderr, "Completed test_backward_compatibility_rom_preset\n");
+  fflush(stderr);
 
   STDOUT << "\n=== All tests passed! ===\n";
+  fprintf(stderr, "About to return from main\n");
+  fflush(stderr);
   return 0;
 }
