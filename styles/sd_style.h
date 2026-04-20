@@ -36,7 +36,6 @@
 #include "blast.h"
 #include "brown_noise_flicker.h"
 #include "lockup.h"
-#include "responsive_styles.h"
 
 // ============================================================
 // SECTION 1: Runtime Node Base Classes

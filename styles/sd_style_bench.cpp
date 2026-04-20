@@ -44,6 +44,7 @@ struct MockFuse {
 
 struct BM {
   float battery() { return 3.7; }
+  int battery_percent() { return 100; }
 };
 
 struct MockDynamicMixer {
@@ -194,7 +195,8 @@ struct CompiledStyleBaseline {
 
     BenchmarkBladeBase blade;
     CompiledStyle style;
-    blade.SetStyle(&style);
+    // Note: compiled styles don't inherit from BladeStyle interface;
+    // we measure them directly without SetStyle() call
 
     const int FRAME_COUNT = 1000;
     const int SIMULATE_TICKS_PER_FRAME = 1;  // One tick per frame at 60fps
