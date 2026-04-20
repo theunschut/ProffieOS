@@ -37,3 +37,5 @@ sound/zero.wav
 # Benchmark artifacts created by Phase 8 performance testing
 styles/sd_style_bench
 styles/sd_style_bench.d
+styles/sd_style_integration_tests
+styles/test_basic.style

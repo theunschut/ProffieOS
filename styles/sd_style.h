@@ -23,6 +23,21 @@
 #include "../functions/ramp.h"
 #include "../functions/battery_level.h"
 
+// Style templates used by Rt* wrappers
+#include "colors.h"
+#include "alpha.h"
+#include "layers.h"
+#include "inout_helper.h"
+#include "fire.h"
+#include "on_spark.h"
+#include "random_flicker.h"
+#include "random_per_led_flicker.h"
+#include "pulsing.h"
+#include "blast.h"
+#include "brown_noise_flicker.h"
+#include "lockup.h"
+#include "responsive_styles.h"
+
 // ============================================================
 // SECTION 1: Runtime Node Base Classes
 // ============================================================
