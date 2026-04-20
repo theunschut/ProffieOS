@@ -173,6 +173,12 @@ public:
 };
 
 // ============================================================
+// SECTION 2.5: Include SD Style Parser
+// ============================================================
+
+#include "sd_style.h"
+
+// ============================================================
 // SECTION 3: Compiled Baseline Measurement
 // ============================================================
 
@@ -293,21 +299,85 @@ ExecutionMetrics measureStyleFromFile(const char* path) {
   // Time the parse operation
   auto parse_start = std::chrono::high_resolution_clock::now();
 
-  // Note: Actual parsing would happen here via parseSDStyleFile()
-  // For now, we just record that we attempted to parse
-  // This is a placeholder for integration with actual sd_style.h parser
+  // Parse the style file using tokenizer and parseColorNode
+  Tokenizer tok(file_contents);
+  tok.next();  // prime first token
+  RtColorNode* root = parseColorNode(tok, 0);
 
   auto parse_end = std::chrono::high_resolution_clock::now();
   auto parse_duration = std::chrono::duration_cast<std::chrono::microseconds>(parse_end - parse_start);
 
-  // For now, return minimal metrics (parse-only)
-  // Full implementation will create RuntimeBladeStyle and execute it
-  metrics.frame_time_us_min = 0;
-  metrics.frame_time_us_avg = 0;
-  metrics.frame_time_us_max = 0;
-  metrics.frame_time_us_stddev = 0;
-  metrics.frame_count = 0;  // Indicates parse-only or error
+  if (!root) {
+    printf("SKIP: %s (parse failed)\n", path);
+    free(file_contents);
+    return metrics;
+  }
 
+  // Create RuntimeBladeStyle wrapper
+  RuntimeBladeStyle* style = new RuntimeBladeStyle(root);
+  if (!style) {
+    printf("SKIP: %s (style creation failed)\n", path);
+    free(file_contents);
+    return metrics;
+  }
+
+  // Warm-up: run a few frames to stabilize
+  BenchmarkBladeBase blade;
+  blade.SetStyle(style);
+
+  const int WARMUP_FRAMES = 10;
+  for (int i = 0; i < WARMUP_FRAMES; i++) {
+    style->run(&blade);
+    for (int led = 0; led < blade.num_leds(); led++) {
+      style->getColor(led);
+    }
+  }
+
+  // Measurement: run 1000 frames and collect timing data
+  const int FRAME_COUNT = 1000;
+  std::vector<uint64_t> frame_times;
+  frame_times.reserve(FRAME_COUNT);
+
+  for (int frame = 0; frame < FRAME_COUNT; frame++) {
+    auto frame_start = std::chrono::high_resolution_clock::now();
+
+    style->run(&blade);
+    for (int led = 0; led < blade.num_leds(); led++) {
+      style->getColor(led);
+    }
+
+    auto frame_end = std::chrono::high_resolution_clock::now();
+    auto frame_duration = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - frame_start);
+    frame_times.push_back(frame_duration.count());
+  }
+
+  // Calculate statistics
+  if (!frame_times.empty()) {
+    uint64_t min_time = *std::min_element(frame_times.begin(), frame_times.end());
+    uint64_t max_time = *std::max_element(frame_times.begin(), frame_times.end());
+
+    uint64_t sum = 0;
+    for (auto t : frame_times) sum += t;
+    uint64_t avg_time = sum / FRAME_COUNT;
+
+    // Standard deviation
+    uint64_t sq_sum = 0;
+    for (auto t : frame_times) {
+      int64_t diff = (int64_t)t - (int64_t)avg_time;
+      sq_sum += diff * diff;
+    }
+    double variance = (double)sq_sum / FRAME_COUNT;
+    uint64_t stddev = (uint64_t)std::sqrt(variance);
+
+    metrics.frame_time_us_min = min_time;
+    metrics.frame_time_us_avg = avg_time;
+    metrics.frame_time_us_max = max_time;
+    metrics.frame_time_us_stddev = stddev;
+    metrics.frame_count = FRAME_COUNT;
+  }
+
+  blade.UnSetStyle();
+  delete style;
   free(file_contents);
   return metrics;
 }
@@ -350,12 +420,13 @@ int main(int argc, char** argv) {
 
   // Print table header
   printf("SD-Loaded Style Performance Measurements\n");
-  printf("-----------------------------------------\n");
-  printf("%-20s | Parse(ms) | AvgFrame(us) | MaxFrame(us) | Var%%\n", "Style");
-  printf("---------+-----------+--------------+--------------+-----\n");
+  printf("=============================================================================================================\n");
+  printf("%-20s | AvgFrame(us) | MinFrame(us) | MaxFrame(us) | Stddev(us) | Variance%% | Parity%% | Status\n", "Style");
+  printf("-----+---------------+--------------+--------------+------------+----------+---------+--------\n");
 
   // Measure each production style
   int success_count = 0;
+  double max_variance_pct = 0;
   for (int i = 0; i < NUM_STYLES; i++) {
     ExecutionMetrics metrics = measureStyleFromFile(production_styles[i]);
 
@@ -367,29 +438,54 @@ int main(int argc, char** argv) {
     }
 
     if (metrics.frame_count > 0) {
-      // Calculate variance percentage vs baseline
-      int variance_pct = 0;
-      if (baseline.frame_time_us_avg > 0) {
-        variance_pct = (int)((metrics.frame_time_us_avg * 100) / baseline.frame_time_us_avg) - 100;
+      // Calculate variance percentage (stddev relative to average)
+      double variance_pct = 0.0;
+      if (metrics.frame_time_us_avg > 0) {
+        variance_pct = (double)metrics.frame_time_us_stddev * 100.0 / (double)metrics.frame_time_us_avg;
       }
 
-      printf("%-20s | %9.3f | %12.1f | %12.1f | %3d%%\n",
+      // Calculate parity percentage vs baseline
+      double parity_pct = 0.0;
+      if (baseline.frame_time_us_avg > 0) {
+        parity_pct = (double)metrics.frame_time_us_avg * 100.0 / (double)baseline.frame_time_us_avg;
+      }
+
+      // Determine status: ACCEPTABLE if variance < 5%, FAIL if > 10%, WARNING otherwise
+      const char* status = "ACCEPTABLE";
+      if (variance_pct > 10.0) {
+        status = "FAIL";
+        max_variance_pct = (variance_pct > max_variance_pct) ? variance_pct : max_variance_pct;
+      } else if (variance_pct > 5.0) {
+        status = "WARNING";
+        max_variance_pct = (variance_pct > max_variance_pct) ? variance_pct : max_variance_pct;
+      }
+
+      printf("%-20s | %12.1f | %12.1f | %12.1f | %10.1f | %8.1f | %7.1f | %s\n",
              last_slash,
-             (double)0.0,  // parse_time_us will be populated later
              (double)metrics.frame_time_us_avg,
+             (double)metrics.frame_time_us_min,
              (double)metrics.frame_time_us_max,
-             variance_pct);
+             (double)metrics.frame_time_us_stddev,
+             variance_pct,
+             parity_pct,
+             status);
       success_count++;
     } else {
-      printf("%-20s | PARSE ERR | (not measured)\n", last_slash);
+      printf("%-20s | SKIPPED (parse error)\n", last_slash);
     }
   }
 
-  printf("---------+-----------+--------------+--------------+-----\n");
+  printf("-----+---------------+--------------+--------------+------------+----------+---------+--------\n");
   printf("\n");
-  printf("Summary: %d/%d styles measured successfully\n", success_count, NUM_STYLES);
-  printf("Baseline performance: %.1f us/frame\n", (double)baseline.frame_time_us_avg);
-  printf("Target: SD-loaded styles within 5%% variance of compiled baseline\n");
+  printf("Summary Statistics\n");
+  printf("  Baseline performance:       %.1f us/frame (compiled StylePtr<>)\n", (double)baseline.frame_time_us_avg);
+  printf("  Baseline std deviation:     %.1f us (%.1f%%)\n",
+         (double)baseline.frame_time_us_stddev,
+         (double)baseline.frame_time_us_stddev * 100.0 / (double)baseline.frame_time_us_avg);
+  printf("  SD-loaded styles measured:  %d/%d\n", success_count, NUM_STYLES);
+  printf("  Maximum variance observed:  %.1f%%\n", max_variance_pct);
+  printf("  Target:                     SD-loaded styles within 5%% variance of compiled baseline\n");
+  printf("  Success:                    %s\n", (max_variance_pct <= 5.0) ? "YES - all within 5%%" : "NO - some exceeded 5%%");
   printf("\n");
 
   return (success_count > 0) ? 0 : 1;
